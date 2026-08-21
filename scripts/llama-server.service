@@ -1,0 +1,11 @@
+[Unit]
+Description=llama.cpp server (Qwen3-Coder-30B-A3B, local coding assistant)
+After=network.target
+
+[Service]
+ExecStart=%h/llama.cpp/scripts/run-server.sh
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
