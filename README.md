@@ -41,7 +41,7 @@
 ~/llama.cpp/build-cuda/bin/llama-server \
   -m ~/models/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf \
   -ngl 99 -ncmoe 34 -fa on -t 6 -lm none \
-  -c 8192 -ctk q8_0 -ctv q8_0 \
+  -c 24576 -ctk q8_0 -ctv q8_0 \
   --host 127.0.0.1 --port 8080
 ```
 
@@ -49,6 +49,8 @@
 - `-ctk q8_0 -ctv q8_0`: KV 캐시 8비트 양자화 — 품질 손실 거의 없이 여유 확보, 프롬프트 처리 속도 34% 향상(360→483 t/s)의 부수 효과
 - `-lm none`: `mmap` 대신 전량 RAM 직접 로드 — CPU 오프로드 텐서의 페이지 폴트 오버헤드 제거
 - `-fa on`: Flash Attention, 품질 손실 없이 무료 속도 향상
+- `-c 24576`: 실측 결과 24576까지는 로드 성공, 28672부터 OOM. 8192 대비 3배 확장(멀티파일 코딩 작업 대응)
+- `-t 6`: 물리 코어 수. 하이퍼스레딩(12)을 켜면 오히려 생성 속도가 11% 느려짐(36.1→32.4 tok/s, 캐시 경합 추정) — 실측으로 확인
 
 전체 실행 스크립트: [`scripts/run-server.sh`](scripts/run-server.sh)
 systemd 유저 서비스 유닛: [`scripts/llama-server.service`](scripts/llama-server.service)
@@ -77,7 +79,7 @@ models:
     model: qwen3-coder-30b-a3b
     apiBase: http://127.0.0.1:8080/v1
     apiKey: none
-    contextLength: 8192
+    contextLength: 24576
     roles:
       - chat
       - edit
