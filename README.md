@@ -80,6 +80,8 @@ models:
     apiBase: http://127.0.0.1:8080/v1
     apiKey: none
     contextLength: 24576
+    capabilities:
+      - tool_use   # 빠뜨리면 Continue.dev가 파일 읽기 등 에이전트/툴 기능을 아예 시도하지 않음
     roles:
       - chat
       - edit
