@@ -8,7 +8,7 @@
 |---|---|
 | GPU | NVIDIA GeForce RTX 2070 SUPER (8GB VRAM, 실사용 가능 ~7.6GB) |
 | CPU | Intel Core i5-12400F (6코어 / 12스레드) |
-| RAM | 32GB |
+| RAM | 32GB DDR5-5600 (**싱글채널** — 1개 슬롯만 사용, 실측 대역폭 29.1 GB/s) |
 | OS | Ubuntu 22.04.5 LTS, Kernel 6.8.0 |
 | CUDA | Driver 580.173.02 (CUDA 13.0), Toolkit 12.6 |
 | 추론 엔진 | [llama.cpp](https://github.com/ggml-org/llama.cpp) (CUDA 백엔드, `-DCMAKE_CUDA_ARCHITECTURES=75`로 소스 빌드) |
@@ -22,7 +22,11 @@
 | Qwen2.5-Coder-32B-Instruct Q4_K_M | 덴스, ngl=20 + 추측 디코딩(0.5B draft) | 6.06 tok/s | 품질은 좋으나 실사용엔 너무 느림 |
 | Qwen2.5-Coder-14B-Instruct Q4_K_M | 덴스, ngl=41 | 15.1~18.3 tok/s | 논리 버그 1건 발견 |
 | Qwen2.5-Coder-7B-Instruct Q5_K_M | 덴스, 전체 GPU 오프로드 | 58.4~64.4 tok/s | 가장 빠르지만 버그 2건(임포트 누락 등) |
-| **Qwen3-Coder-30B-A3B-Instruct Q4_K_M** | **MoE (30B 총/3B 활성), `--n-cpu-moe 34`** | **37.5~38.4 tok/s** | **최종 채택** — 속도와 코드 구조 완성도의 최적 균형점 |
+| Qwen3-Coder-30B-A3B-Instruct Q4_K_M | MoE (30B 총/3B 활성), `-ncmoe 36` | 28.7~38.4 tok/s | MoE 채택 — 속도와 코드 구조 완성도의 최적 균형점 |
+| Qwen3-Coder-30B-A3B-Instruct IQ4_XS | 동일 모델, `-ncmoe 34` | 37.8 tok/s | 같은 모델 더 작은 양자화 → ncmoe 감소 |
+| **Qwen3-Coder-30B-A3B-Instruct UD-Q3_K_XL** | **동일 모델, `-ncmoe 32`** | **43.2 tok/s** | **최종 채택** — 대역폭 병목 구조상 양자화를 낮출수록 빨라짐(아래 분석 참고) |
+
+> 위 3개 MoE 행은 모두 같은 모델이며 양자화만 다릅니다. `-c 36864` 운용 컨텍스트 기준 실측이라 벤치마크 기본 컨텍스트 수치보다 낮게 나옵니다.
 
 ### 왜 MoE(Qwen3-Coder-30B-A3B)인가
 
@@ -39,14 +43,14 @@
 
 ```bash
 ~/llama.cpp/build-cuda/bin/llama-server \
-  -m ~/models/Qwen3-Coder-30B-A3B-Instruct-IQ4_XS.gguf \
-  -ngl 99 -ncmoe 34 -fa on -t 6 -lm none \
+  -m ~/models/Qwen3-Coder-30B-A3B-Instruct-UD-Q3_K_XL.gguf \
+  -ngl 99 -ncmoe 32 -fa on -t 6 -lm none \
   -c 36864 -ctk q8_0 -ctv q8_0 \
   --host 127.0.0.1 --port 8080
 ```
 
-- **양자화: IQ4_XS (16.38GB)**. 처음엔 Q4_K_M(18.56GB)을 썼는데, i-quant인 IQ4_XS로 바꾸니 같은 컨텍스트에서 `ncmoe`를 2 낮출 수 있어(GPU에 더 많이 올라감) 미세하게 더 빠르고 여유도 더 생김. 품질 차이는 체감상 없음.
-- `-ngl 99 -ncmoe 34`: 최대한 GPU에 올리되, 전문가 레이어 34개는 CPU에 남김
+- **양자화: UD-Q3_K_XL (13.81GB)**. Q4_K_M(18.56GB) → IQ4_XS(16.38GB) → UD-Q3_K_XL 순으로 내려왔음. 아래 "성능 병목 분석"에서 밝혔듯 **생성 속도가 메모리 대역폭에 묶여 있어서, 전문가 가중치가 작아지는 것이 그대로 속도가 됨**. IQ4_XS 대비 파일 16% 감소 → `ncmoe` 34→32 (GPU에 2레이어 더) → **생성 속도 +14~19%**. Unsloth UD(Dynamic) 계열은 중요 텐서를 고정밀로 유지해 3비트대에서도 품질 저하를 최소화함.
+- `-ngl 99 -ncmoe 32`: 최대한 GPU에 올리되, 전문가 레이어 32개는 CPU에 남김
 - `-ctk q8_0 -ctv q8_0`: KV 캐시 8비트 양자화 — 품질 손실 거의 없이 여유 확보, 프롬프트 처리 속도 34% 향상(360→483 t/s)의 부수 효과
 - `-lm none`: `mmap` 대신 전량 RAM 직접 로드 — CPU 오프로드 텐서의 페이지 폴트 오버헤드 제거
 - `-fa on`: Flash Attention, 품질 손실 없이 무료 속도 향상
@@ -56,6 +60,38 @@
 
 전체 실행 스크립트: [`scripts/run-server.sh`](scripts/run-server.sh)
 systemd 유저 서비스 유닛: [`scripts/llama-server.service`](scripts/llama-server.service)
+
+## 성능 병목 분석 — 이 구성의 속도를 결정하는 것은 GPU가 아니라 RAM 대역폭
+
+MoE 오프로드 구성에서는 매 토큰마다 CPU가 담당한 전문가 레이어의 가중치를 RAM에서 읽어와야 합니다. 이 시스템에서는 그것이 명확한 병목이며, 세 가지 독립적인 측정이 모두 같은 결론을 가리킵니다.
+
+**1) 스레드 스케일링이 조기 포화**
+
+| 스레드 | 2 | 3 | 4 | 5 | 6 |
+|---|---|---|---|---|---|
+| tg128 (tok/s) | 25.0 | 32.4 | 36.7 | 38.1 | 38.7 |
+| 직전 대비 | — | +30% | +13% | +3.7% | **+1.5%** |
+
+5→6코어에서 겨우 1.5%. CPU 연산 자원이 남는데도 속도가 오르지 않음 = 메모리 버스 포화.
+
+**2) CPU 전문가 레이어당 비용이 완전히 선형**
+
+`-ncmoe` 34 / 40 / 48 실측(IQ4_XS): 39.12 / 35.40 / 31.42 tok/s
+→ 토큰당 25.56 / 28.25 / 31.83 ms → **레이어당 일정하게 0.448 ms**
+
+여기서 시간 분해가 나옵니다. `ncmoe=34`일 때 토큰당 25.6ms 중 **15.2ms(약 60%)가 CPU 전문가 가중치 읽기**, 나머지 10.3ms가 GPU 연산 + 고정 오버헤드입니다.
+
+**3) 실측 메모리 대역폭이 이론치와 일치**
+
+`gcc -O3 -march=native -fopenmp` 로 컴파일한 순차 읽기 벤치마크: **29.1 GB/s**.
+DDR5-5600 싱글채널 이론 피크 44.8 GB/s의 약 65%로, 전형적인 실측 효율입니다.
+
+### 실용적 결론
+
+- **더 낮은 비트 양자화가 그대로 속도가 됨.** 대역폭 병목이므로 전문가 가중치 크기 감소분이 거의 그대로 생성 속도로 환산됩니다. Q4_K_M → IQ4_XS → UD-Q3_K_XL로 내려오며 속도가 계속 올랐고, 이것이 최종 설정에서 3비트대 양자화를 택한 이유입니다.
+- **RAM을 듀얼채널로 만들면 큰 이득이 예상됨.** 이 머신은 32GB 모듈이 `Controller0-DIMM1` 한 곳에만 꽂혀 있어 싱글채널로 동작합니다(`Controller1` 슬롯 2개 공석). 동일 규격 모듈을 하나 더 추가해 대역폭이 2배가 되면 CPU 구간 15.2ms → 약 8.5ms로 줄어 **50 tok/s 이상**이 기대됩니다. 단, VRAM이 큰 GPU로 교체해 모델 전체가 VRAM에 올라가면 이 병목 자체가 사라지므로, GPU 업그레이드 계획이 있다면 우선순위를 비교해 판단하세요.
+- **CPU 코어 수를 늘려도 소용없음.** 위 스케일링 곡선이 보여주듯 이 워크로드는 연산이 아니라 대역폭에 묶여 있습니다.
+- **`-ot` 텐서 단위 세밀 오프로드는 이 구성에서 무의미했음.** 작은 컨텍스트에서는 `-ncmoe`보다 약 3% 빨랐지만(레이어 단위보다 촘촘하게 VRAM을 채울 수 있어서), 실제 운용 컨텍스트(36864)에서는 이미 VRAM이 포화라 모든 변형이 OOM이었습니다. 참고로 `-ot` 구분자는 `llama-bench`가 `;`, `llama-cli`/`llama-server`가 `,`로 서로 다릅니다.
 
 ## 상시 구동 (systemd)
 
