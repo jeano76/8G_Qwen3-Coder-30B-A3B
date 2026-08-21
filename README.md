@@ -39,19 +39,20 @@
 
 ```bash
 ~/llama.cpp/build-cuda/bin/llama-server \
-  -m ~/models/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf \
-  -ngl 99 -ncmoe 36 -fa on -t 6 -lm none \
-  -c 32768 -ctk q8_0 -ctv q8_0 \
+  -m ~/models/Qwen3-Coder-30B-A3B-Instruct-IQ4_XS.gguf \
+  -ngl 99 -ncmoe 34 -fa on -t 6 -lm none \
+  -c 36864 -ctk q8_0 -ctv q8_0 \
   --host 127.0.0.1 --port 8080
 ```
 
-- `-ngl 99 -ncmoe 36`: 최대한 GPU에 올리되, 전문가 레이어 36개는 CPU에 남김
+- **양자화: IQ4_XS (16.38GB)**. 처음엔 Q4_K_M(18.56GB)을 썼는데, i-quant인 IQ4_XS로 바꾸니 같은 컨텍스트에서 `ncmoe`를 2 낮출 수 있어(GPU에 더 많이 올라감) 미세하게 더 빠르고 여유도 더 생김. 품질 차이는 체감상 없음.
+- `-ngl 99 -ncmoe 34`: 최대한 GPU에 올리되, 전문가 레이어 34개는 CPU에 남김
 - `-ctk q8_0 -ctv q8_0`: KV 캐시 8비트 양자화 — 품질 손실 거의 없이 여유 확보, 프롬프트 처리 속도 34% 향상(360→483 t/s)의 부수 효과
 - `-lm none`: `mmap` 대신 전량 RAM 직접 로드 — CPU 오프로드 텐서의 페이지 폴트 오버헤드 제거
 - `-fa on`: Flash Attention, 품질 손실 없이 무료 속도 향상
-- `-c 32768`: 처음엔 `ncmoe=34`로 24576까지만 확보했는데, Cline처럼 시스템 프롬프트가 긴 툴(25544토큰 요청)에서 컨텍스트 초과 에러가 발생함(`request (25544 tokens) exceeds the available context size (24576 tokens)`) → `ncmoe`를 36으로 2 올려 VRAM 여유를 만들고 32768까지 확장. 생성 속도는 38.4→28.7 tok/s로 다소 낮아짐(속도-컨텍스트 트레이드오프)
+- `-c 36864`: Cline처럼 시스템 프롬프트가 긴 툴에서 25544토큰까지 요청이 커지는 걸 확인(`request (25544 tokens) exceeds the available context size (24576 tokens)`) → IQ4_XS + ncmoe=34 조합으로 36864까지 확장(요구치 대비 44% 여유), 생성 속도는 오히려 34.9 tok/s로 준수함
 - `-t 6`: 물리 코어 수. 하이퍼스레딩(12)을 켜면 오히려 생성 속도가 11% 느려짐(36.1→32.4 tok/s, 캐시 경합 추정) — 실측으로 확인
-- 참고: `--parallel`(동시 슬롯 수)은 `kv_unified` 모드라 슬롯 수를 줄여도 VRAM 여유가 안 생김 — 컨텍스트를 늘리려면 `-ncmoe`를 올리는 것만 유효했음
+- 참고: `--parallel`(동시 슬롯 수)은 `kv_unified` 모드라 슬롯 수를 줄여도 VRAM 여유가 안 생김. 데스크톱 GPU 점유(Xorg/GNOME ~220MB)도 회수 시도했으나 이 CPU(i5-12400F "F"모델)는 내장 그래픽이 없어 구조적으로 불가능 — 컨텍스트를 늘리려면 `-ncmoe`를 올리거나 더 작은 양자화를 쓰는 것만 유효했음
 
 전체 실행 스크립트: [`scripts/run-server.sh`](scripts/run-server.sh)
 systemd 유저 서비스 유닛: [`scripts/llama-server.service`](scripts/llama-server.service)
@@ -80,7 +81,7 @@ models:
     model: qwen3-coder-30b-a3b
     apiBase: http://127.0.0.1:8080/v1
     apiKey: none
-    contextLength: 32768
+    contextLength: 36864
     capabilities:
       - tool_use   # 빠뜨리면 Continue.dev가 파일 읽기 등 에이전트/툴 기능을 아예 시도하지 않음
     roles:
