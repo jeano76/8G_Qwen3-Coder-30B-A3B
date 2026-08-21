@@ -40,17 +40,18 @@
 ```bash
 ~/llama.cpp/build-cuda/bin/llama-server \
   -m ~/models/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf \
-  -ngl 99 -ncmoe 34 -fa on -t 6 -lm none \
-  -c 24576 -ctk q8_0 -ctv q8_0 \
+  -ngl 99 -ncmoe 36 -fa on -t 6 -lm none \
+  -c 32768 -ctk q8_0 -ctv q8_0 \
   --host 127.0.0.1 --port 8080
 ```
 
-- `-ngl 99 -ncmoe 34`: 최대한 GPU에 올리되, VRAM 한계로 전문가 레이어 34개는 CPU에 남김 (실측 최대 오프로드 한계는 32, 서버 안정성을 위해 여유 2 추가)
+- `-ngl 99 -ncmoe 36`: 최대한 GPU에 올리되, 전문가 레이어 36개는 CPU에 남김
 - `-ctk q8_0 -ctv q8_0`: KV 캐시 8비트 양자화 — 품질 손실 거의 없이 여유 확보, 프롬프트 처리 속도 34% 향상(360→483 t/s)의 부수 효과
 - `-lm none`: `mmap` 대신 전량 RAM 직접 로드 — CPU 오프로드 텐서의 페이지 폴트 오버헤드 제거
 - `-fa on`: Flash Attention, 품질 손실 없이 무료 속도 향상
-- `-c 24576`: 실측 결과 24576까지는 로드 성공, 28672부터 OOM. 8192 대비 3배 확장(멀티파일 코딩 작업 대응)
+- `-c 32768`: 처음엔 `ncmoe=34`로 24576까지만 확보했는데, Cline처럼 시스템 프롬프트가 긴 툴(25544토큰 요청)에서 컨텍스트 초과 에러가 발생함(`request (25544 tokens) exceeds the available context size (24576 tokens)`) → `ncmoe`를 36으로 2 올려 VRAM 여유를 만들고 32768까지 확장. 생성 속도는 38.4→28.7 tok/s로 다소 낮아짐(속도-컨텍스트 트레이드오프)
 - `-t 6`: 물리 코어 수. 하이퍼스레딩(12)을 켜면 오히려 생성 속도가 11% 느려짐(36.1→32.4 tok/s, 캐시 경합 추정) — 실측으로 확인
+- 참고: `--parallel`(동시 슬롯 수)은 `kv_unified` 모드라 슬롯 수를 줄여도 VRAM 여유가 안 생김 — 컨텍스트를 늘리려면 `-ncmoe`를 올리는 것만 유효했음
 
 전체 실행 스크립트: [`scripts/run-server.sh`](scripts/run-server.sh)
 systemd 유저 서비스 유닛: [`scripts/llama-server.service`](scripts/llama-server.service)
@@ -79,7 +80,7 @@ models:
     model: qwen3-coder-30b-a3b
     apiBase: http://127.0.0.1:8080/v1
     apiKey: none
-    contextLength: 24576
+    contextLength: 32768
     capabilities:
       - tool_use   # 빠뜨리면 Continue.dev가 파일 읽기 등 에이전트/툴 기능을 아예 시도하지 않음
     roles:
@@ -88,6 +89,15 @@ models:
       - apply
       - autocomplete
 ```
+
+## Cline 연동
+
+Cline은 툴 정의가 포함된 시스템 프롬프트가 길어서(대화가 누적되면 25000토큰↑) `-c` 값을 넉넉히 잡아야 합니다. VSCode Cline 확장 설정에서:
+
+- API Provider: `OpenAI Compatible`
+- Base URL: `http://127.0.0.1:8080/v1`
+- API Key: 아무 값이나(서버가 검사하지 않음)
+- Model: `qwen3-coder-30b-a3b`
 
 ## 알아둘 점 / 한계
 
