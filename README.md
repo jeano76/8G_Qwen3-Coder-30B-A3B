@@ -146,6 +146,43 @@ resolvable and the 0.448 ms/layer model still holds — 38.4 tok/s measured at `
 predicted. Moving them off the GPU also more than pays for the larger compute buffer: VRAM went *down*,
 7427 → 7334 MiB. `-ub 4096` is past the knee — no further gain, and generation starts to suffer.
 
+### Before and after, in production
+
+The same aggregation run against a real Cline session on the current configuration:
+
+| | Before | After |
+|---|---:|---:|
+| Model / config | Qwen3-Coder-30B-A3B, `-ub 512 -c 65536` | Qwen3.6-35B-A3B, `-ub 2048 -np 2 -kvu -c 131072` |
+| Generation | 15.1 tok/s | **34.3 tok/s** |
+| Prompt processing | 172.1 s / 56,032 tok | **49.9 s / 22,667 tok** |
+| Prompt share of wall time | **47%** | **6%** |
+| Prefix-cache hits | 4 of 18 (22%) | **26 of 27 (96%)** |
+| Largest single reprocess | 24,761 tok / **70.3 s** | 5,488 tok / **6.0 s** (cold start) |
+| Deepest context reached | 28,312 | 44,721 |
+| Output tokens per minute of server time | 477 | **1,925** |
+
+Every 40–70 s stall is gone: the only reprocess in the session was the initial cold prompt, and the
+other 26 turns hit the cache. Context reached 44,721 tokens without triggering a condense, which the
+original `-c 36864` would have done at 29.5K.
+
+Generation held up across an 8× growth in context, falling only 29%:
+
+```
+ 5.5K → 33.9      21K → 33.5      38K → 30.9
+ 6.8K → 39.1      27K → 32.4      43K → 29.9
+  12K → 36.6      32K → 32.3      45K → 28.0
+```
+
+The previous model fell 45% over the same kind of range (38.4 tok/s short → 21.1 at 22K) and averaged
+15.1 in practice. 28.0 tok/s at 44.7K is still 33% faster than what the old setup managed at 22K.
+
+Two caveats. The prompt-processing rate reads *lower* (454 vs 839 t/s in the benchmark) because 26 of
+27 calls were cache hits processing a few dozen incremental tokens each, where fixed overhead
+dominates — the drop from 56,032 to 22,667 total tokens processed is the cache working, not a
+regression. And these are two different real sessions, not a controlled experiment; the controlled
+comparison is the fixed-prompt benchmark above. What transfers cleanly is the structural change: cache
+hit rate and the share of wall time spent reprocessing.
+
 ### Slot count (`-np`)
 
 With the default of 4 slots, 14 of 18 slot selections in the session log fell back to LRU: four separate
@@ -415,6 +452,35 @@ MoE 오프로드에서 전문가 가중치는 ubatch당 한 번 RAM에서 읽혀
 | 4096 / 42 | 703 t/s | 20.21 | 6832 |
 
 `-ub 2048`은 `ncmoe 38`에서 VRAM이 모자라지만, 그 대가로 내주는 전문가 레이어 2개는 **사실상 공짜**입니다. 22k 컨텍스트에서 2레이어는 토큰당 시간의 1.9%로 측정 편차보다 작습니다. (짧은 컨텍스트에서는 분해가 되고 "레이어당 0.448 ms" 모델이 그대로 맞습니다 — `ncmoe 40`에서 실측 38.4 tok/s, 예측 38.9 tok/s.) 게다가 레이어 2개를 CPU로 내린 절감이 커진 compute buffer보다 커서 **VRAM이 오히려 줄었습니다**(7427 → 7334 MiB). `-ub 4096`은 무릎을 지난 지점이라 추가 이득이 없고 생성만 깎입니다.
+
+### 튜닝 전후 실사용 비교
+
+같은 방식으로 현재 설정에서 실제 Cline 세션을 집계한 결과입니다.
+
+| | 이전 | 이후 |
+|---|---:|---:|
+| 모델 / 설정 | Qwen3-Coder-30B-A3B, `-ub 512 -c 65536` | Qwen3.6-35B-A3B, `-ub 2048 -np 2 -kvu -c 131072` |
+| 생성 속도 | 15.1 tok/s | **34.3 tok/s** |
+| 프롬프트 처리 | 172.1초 / 56,032토큰 | **49.9초 / 22,667토큰** |
+| 벽시계 중 프롬프트 비중 | **47%** | **6%** |
+| 접두부 캐시 적중 | 18회 중 4회 (22%) | **27회 중 26회 (96%)** |
+| 최대 단일 재처리 | 24,761토큰 / **70.3초** | 5,488토큰 / **6.0초** (콜드 스타트) |
+| 최대 도달 컨텍스트 | 28,312 | 44,721 |
+| 서버 시간 1분당 생성 토큰 | 477 | **1,925** |
+
+40~70초짜리 스톨이 전부 사라졌습니다. 세션 전체에서 재처리는 최초 콜드 프롬프트 하나뿐이었고 나머지 26턴은 모두 캐시 적중이었습니다. 컨텍스트가 44,721까지 갔는데도 압축이 걸리지 않았는데, 원래 설정인 `-c 36864`였다면 29.5k에서 압축이 시작됐을 구간입니다.
+
+생성 속도는 컨텍스트가 8배 늘어나는 동안 29%만 떨어졌습니다.
+
+```
+ 5.5k → 33.9      21k → 33.5      38k → 30.9
+ 6.8k → 39.1      27k → 32.4      43k → 29.9
+  12k → 36.6      32k → 32.3      45k → 28.0
+```
+
+이전 모델은 같은 범위에서 45% 하락했고(짧은 컨텍스트 38.4 → 22k에서 21.1) 실사용 평균이 15.1이었습니다. 44.7k에서의 28.0 tok/s는 이전 구성이 22k에서 내던 21.1보다도 33% 빠릅니다.
+
+두 가지 해석 주의점이 있습니다. 프롬프트 처리 속도가 벤치마크(839 t/s)보다 낮은 454 t/s로 찍히는데, 이는 27회 중 26회가 캐시 적중이라 매번 증분 토큰 수십 개만 처리했고 그런 소형 호출에서는 고정 오버헤드가 지배하기 때문입니다. 총 처리 토큰이 56,032에서 22,667로 줄어든 것 자체가 캐시가 일하고 있다는 증거이지 성능 저하가 아닙니다. 그리고 이 둘은 서로 다른 실제 세션이지 통제된 실험이 아닙니다 — 통제 비교는 위의 고정 프롬프트 벤치마크 쪽입니다. 여기서 그대로 옮겨지는 것은 구조적 변화, 즉 캐시 적중률과 재처리에 쓰인 벽시계 비중입니다.
 
 ### 슬롯 수 `-np`
 
