@@ -1,4 +1,114 @@
+# Running Qwen3-Coder-30B-A3B on an 8GB GPU
+
+**English** | [한국어](#8gb-vram에서-qwen3-coder-30b-a3b-로컬-코딩-어시스턴트-구동하기)
+
+Measured notes and the final configuration for running a 30B-class coding LLM at usable speed on a single 8GB GPU. Every number below was measured on the machine described here — including the approaches that turned out to be slower.
+
+**Result: 45.07 tok/s generation, 438.73 t/s prompt processing**, running a 30.5B-parameter model on a GPU that cannot hold it.
+
+## Hardware
+
+| Component | Spec |
+|---|---|
+| GPU | NVIDIA GeForce RTX 2070 SUPER (8GB VRAM, ~7.6GB usable) |
+| CPU | Intel Core i5-12400F (6 cores / 12 threads) |
+| RAM | 32GB DDR5-5600, **single channel** (one DIMM populated; 29.1 GB/s measured) |
+| OS | Ubuntu 22.04.5 LTS, kernel 6.8.0 |
+| CUDA | Driver 580.173.02 (CUDA 13.0), Toolkit 12.6 |
+| Runtime | [llama.cpp](https://github.com/ggml-org/llama.cpp), CUDA backend built from source (`-DCMAKE_CUDA_ARCHITECTURES=75`) |
+
+## Why a MoE model
+
+Dense models were measured first, on the same prompt and hardware:
+
+| Model | Setup | Generation |
+|---|---|---:|
+| Qwen2.5-Coder-32B Q4_K_M | dense, 20 layers on GPU + speculative decoding | 6.1 tok/s |
+| Qwen2.5-Coder-14B Q4_K_M | dense, 41 layers on GPU | 15–18 tok/s |
+| Qwen2.5-Coder-7B Q5_K_M | dense, fully on GPU | 58–64 tok/s |
+| **Qwen3-Coder-30B-A3B UD-Q3_K_XL** | **MoE, partial expert offload** | **43.2 tok/s** |
+
+The 32B dense model was unusable at 6 tok/s; the 7B was fast but produced buggier code. Qwen3-Coder-30B-A3B has 30.5B total parameters but activates only ~3B per token, so it carries 30B-class knowledge at roughly 3B-class compute.
+
+llama.cpp's `--n-cpu-moe` then keeps only part of the expert FFN weights in system RAM while attention and the rest stay on the GPU. That is what makes a 13.81GB model run on 8GB of VRAM.
+
+## Final configuration
+
+```bash
+llama-server \
+  -m Qwen3-Coder-30B-A3B-Instruct-UD-Q3_K_XL.gguf \
+  -ngl 99 -ncmoe 32 -fa on -t 6 -lm none \
+  -c 36864 -ctk q8_0 -ctv q8_0 \
+  --temp 0.7 --top-p 0.8 --top-k 20 --repeat-penalty 1.05 --min-p 0.0 \
+  --host 127.0.0.1 --port 8080
+```
+
+| Flag | Why |
+|---|---|
+| `-ncmoe 32` | Keep 32 layers' expert weights on the CPU; everything else on the GPU |
+| `-lm none` | Load fully into RAM instead of mmap — removes page-fault overhead on offloaded tensors (prompt processing +34%) |
+| `-t 6` | Physical cores only. Using all 12 threads is **11% slower** (36.1 → 32.4 tok/s) |
+| `-fa on` | Flash Attention — free speed, no quality cost |
+| `-ctk/-ctv q8_0` | 8-bit KV cache. Do **not** drop V to `q4_0` on this GPU (see below) |
+| sampling flags | Qwen3-Coder's recommended values. llama-server defaults (temp 0.80 / top_p 0.95 / top_k 40) are too loose for agent coding and invite wrong APIs and imports |
+
+Quantization went Q4_K_M (18.56GB) → IQ4_XS (16.38GB) → **UD-Q3_K_XL (13.81GB)**. Because generation is bandwidth-bound here, each shrink both frees VRAM (`ncmoe` 36 → 34 → 32) and cuts per-token RAM traffic, so speed rose at every step.
+
+## The bottleneck is RAM bandwidth, not the GPU
+
+Three independent measurements agree:
+
+1. **Thread scaling saturates early.** 2→3 cores gives +30%, but 5→6 cores gives only **+1.5%** — spare CPU compute that speed does not follow.
+2. **Cost per offloaded expert layer is flat at 0.448 ms** across `ncmoe` 34/40/48. At `ncmoe=32`, roughly 60% of each token's time is spent reading expert weights from RAM.
+3. **Measured sequential read bandwidth is 29.1 GB/s** — about 65% of the 44.8 GB/s theoretical peak for single-channel DDR5-5600.
+
+The practical consequence: this machine runs **single channel**, with one DIMM in `Controller0-DIMM1` and `Controller1` empty. Adding a matching module should roughly halve the CPU-side time. Adding CPU cores would not help at all.
+
+## What did not work
+
+| Attempt | Result |
+|---|---|
+| Speculative decoding with a small draft model | Effective on the 32B dense model, but **halved throughput to 17.3 tok/s** on the MoE — the draft model competes for the same CPU cores already saturated by expert offload |
+| `q4_0` V cache | Buys +33% context at the same `ncmoe`, but runs **13.5% slower** (44.8 → 38.8 tok/s). Turing (sm_75) has no optimized flash-attention path for `q4_0` V, so it pays full dequantization cost |
+| Per-tensor `-ot` offload | ~3% faster at small context, but OOMs at the production context — VRAM is already saturated |
+| Reducing `--parallel` | No VRAM freed; the server uses a unified KV cache across slots |
+
+## Client setup (Cline)
+
+Point any OpenAI-compatible client at `http://127.0.0.1:8080/v1`. For Cline, **`contextWindow` must be set** — without it Cline grows conversations unbounded until the server hard-errors:
+
+```
+error: request (41403 tokens) exceeds the available context size (36864 tokens)
+```
+
+Raising `-c` is the wrong fix: requests kept growing (25544 → 41403), and a larger context forces `ncmoe` up, costing 4–11% throughput. Cline condenses at 0.9 / 0.7 of `contextWindow` once told, so setting it leaves the fast server config untouched:
+
+```json
+{
+  "provider": "openai-compatible",
+  "baseUrl": "http://127.0.0.1:8080/v1",
+  "apiKey": "sk-no-key-required",
+  "model": "Qwen3-Coder-30B-A3B-Instruct-UD-Q3_K_XL.gguf",
+  "contextWindow": 36864,
+  "maxTokens": 4096
+}
+```
+
+Note that Cline only sends sampling parameters when they are explicitly configured, so the server-side defaults above are what it actually gets.
+
+## Caveats
+
+- This is a compromise shaped by 8GB of VRAM. With a larger card the model fits entirely in VRAM, `--n-cpu-moe` drops toward 0, and the RAM-bandwidth bottleneck disappears.
+- Generated code still needs review. Bugs were found in the 7B and 14B output (missing imports, non-existent parameter names); 30B-A3B was the most reliable but not infallible.
+- `llama-cli` / `llama-bench` and `llama-server` use different default context and batch sizes, so the same `-ncmoe` can fit in one and OOM in another. Leave headroom when changing values.
+
+Full measurement logs, per-flag reasoning, and the complete benchmark appendix are in the Korean document below.
+
+---
+
 # 8GB VRAM에서 Qwen3-Coder-30B-A3B 로컬 코딩 어시스턴트 구동하기
+
+[English](#running-qwen3-coder-30b-a3b-on-an-8gb-gpu) | **한국어**
 
 단일 8GB급 GPU(NVIDIA RTX 2070 SUPER)에서 실사용 가능한 속도로 로컬 코딩 LLM을 돌리기 위한 실험 기록과 최종 설정입니다. 여러 모델 크기(7B/14B/32B/MoE)를 직접 벤치마크하고, 8GB VRAM 제약 아래 속도와 코드 품질의 균형점을 찾았습니다.
 
