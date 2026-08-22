@@ -38,7 +38,7 @@ llama.cpp's `--n-cpu-moe` then keeps only part of the expert FFN weights in syst
 llama-server \
   -m Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf \
   -ngl 99 -ncmoe 33 -fa on -t 6 -lm none -np 2 -kvu -ub 2048 \
-  -c 131072 -ctk q8_0 -ctv q8_0 -rea off \
+  -c 131072 -ctk q8_0 -ctv q8_0 -sps 0.5 -rea off \
   --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 \
   --host 127.0.0.1 --port 8080
 ```
@@ -53,6 +53,7 @@ sampling values differ.
 |---|---|
 | `-ncmoe 33` | Keep 33 of 40 layers' expert weights on the CPU. The OOM floor at this context is 32 |
 | `-c 131072` | Costs 2.4% against 65536 and puts Cline's condense threshold at 114K, so prompt-cache rebuilds stop happening. Affordable because only 10 of 40 layers run full attention |
+| `-sps 0.5` | Slot-prompt similarity floor. The default of 0.10 lets a barely-related prompt claim a slot holding a 60K cache and destroy it |
 | `-rea off` | Disable thinking. Thought tokens are latency on every single tool call in an agent loop |
 | sampling flags | The model's own recommended values, from its GGUF metadata. **Not** Qwen3-Coder's 0.7 / 0.8 / 1.05 |
 
@@ -161,9 +162,13 @@ The same aggregation run against a real Cline session on the current configurati
 | Deepest context reached | 28,312 | 44,721 |
 | Output tokens per minute of server time | 477 | **1,925** |
 
-Every 40–70 s stall is gone: the only reprocess in the session was the initial cold prompt, and the
-other 26 turns hit the cache. Context reached 44,721 tokens without triggering a condense, which the
-original `-c 36864` would have done at 29.5K.
+No stall occurred in this window: the only reprocess was the initial cold prompt, and the other 26
+turns hit the cache. Context reached 44,721 tokens without triggering a condense, which the original
+`-c 36864` would have done at 29.5K.
+
+**This window was too short to conclude stalls were eliminated.** Watching for several more hours
+showed 40–80 s reprocesses still happening, from two causes that this 13-minute sample did not reach.
+See the next section.
 
 Generation held up across an 8× growth in context, falling only 29%:
 
@@ -194,6 +199,33 @@ costs no VRAM either way.
 > **`-np N` silently disables unified KV.** Its default is "enabled only when the slot count is auto",
 > so `-np 2` alone turns `-c 65536` into 32768 per slot, which then breaks a client configured for a
 > 61440 context window. Always pass `-kvu` with it.
+
+### Slot-prompt similarity (`-sps`) — what still stalls
+
+Over a longer observation the 40–80 s reprocesses came back. Two distinct causes, only one fixable:
+
+**Condense, unavoidable.** With `contextWindow` at 126,976 Cline compacts at ~114K, exactly as
+designed — measured at 117,052 → 58,588 tokens and 115,482 → 35,464. Each compaction replaces the head
+of the conversation with a summary, so the prefix changes and the cache is void. The `--cache-reuse`
+A/B above establishes this cannot be worked around.
+
+**A near-unrelated prompt claiming a warm slot — fixable.** The two largest stalls of the day were
+preceded by these slot selections:
+
+```
+f_sim_best = 0.103 (> 0.100 thold)  → 53,543 tokens reprocessed, 76.5 s
+f_sim_best = 0.100 (> 0.100 thold)  → 55,876 tokens reprocessed, 81.9 s
+```
+
+Ten percent similarity. `--slot-prompt-similarity` defaults to **0.10**, so a prompt sharing nothing
+but the system preamble still qualifies to take over a slot holding a 60K cache — and destroys it. Of
+178 slot selections in one afternoon, 156 were healthy (≥0.9) and only 3 fell below 0.2, but those 3
+carried the worst stalls. Raising the floor to `0.5` sends such requests to the other slot instead,
+leaving the live cache intact for when its conversation returns. The reprocess cost of the odd request
+is unchanged; what changes is that it no longer takes a 60K cache down with it.
+
+Do not raise it much further: the 0.5–0.9 band (16 of 178 selections here) is still worth reusing
+partially. If mid-range reprocessing grows after the change, lower it to 0.3.
 
 ### Context size (`-c`)
 
@@ -344,7 +376,7 @@ Full measurement logs, per-flag reasoning, and the complete benchmark appendix a
 ~/llama.cpp/build-cuda/bin/llama-server \
   -m ~/models/Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf \
   -ngl 99 -ncmoe 33 -fa on -t 6 -lm none -np 2 -kvu -ub 2048 \
-  -c 131072 -ctk q8_0 -ctv q8_0 -rea off \
+  -c 131072 -ctk q8_0 -ctv q8_0 -sps 0.5 -rea off \
   --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 \
   --host 127.0.0.1 --port 8080
 ```
@@ -353,6 +385,7 @@ Full measurement logs, per-flag reasoning, and the complete benchmark appendix a
 
 - `-ncmoe 33`: 40개 레이어 중 33개의 전문가 가중치를 CPU에. 이 컨텍스트에서 OOM 바닥은 32입니다
 - `-c 131072`: 65536 대비 2.4% 비용으로 Cline 압축 임계를 114k로 올려 캐시 재구축을 없앱니다. 40개 중 10개만 풀 어텐션이라 감당 가능합니다
+- **`-sps 0.5`**: 슬롯 재사용 최소 유사도. 기본값 0.10은 거의 무관한 프롬프트가 6만 토큰 캐시를 들고 있는 슬롯을 차지해 파괴하도록 허용합니다(아래 절 참고)
 - `-rea off`: thinking 차단. 에이전트 루프에서는 사고 토큰이 매 툴 콜마다 지연으로 쌓입니다
 - 샘플링 `--temp 1.0 --top-p 0.95 --top-k 20`: GGUF 메타데이터의 모델 권장값입니다. Qwen3-Coder용 0.7 / 0.8 / 1.05가 **아닙니다**
 - cline `contextWindow`는 **126976**(= 131072 − 4096)
@@ -484,7 +517,9 @@ MoE 오프로드에서 전문가 가중치는 ubatch당 한 번 RAM에서 읽혀
 | 최대 도달 컨텍스트 | 28,312 | 44,721 |
 | 서버 시간 1분당 생성 토큰 | 477 | **1,925** |
 
-40~70초짜리 스톨이 전부 사라졌습니다. 세션 전체에서 재처리는 최초 콜드 프롬프트 하나뿐이었고 나머지 26턴은 모두 캐시 적중이었습니다. 컨텍스트가 44,721까지 갔는데도 압축이 걸리지 않았는데, 원래 설정인 `-c 36864`였다면 29.5k에서 압축이 시작됐을 구간입니다.
+이 구간에서는 스톨이 없었습니다. 재처리는 최초 콜드 프롬프트 하나뿐이었고 나머지 26턴은 모두 캐시 적중이었습니다. 컨텍스트가 44,721까지 갔는데도 압축이 걸리지 않았는데, 원래 설정인 `-c 36864`였다면 29.5k에서 압축이 시작됐을 구간입니다.
+
+**다만 이 13분 표본으로 "스톨이 사라졌다"고 볼 수는 없습니다.** 이후 몇 시간을 더 관측하니 40~80초짜리 재처리가 계속 나왔습니다. 이 짧은 표본이 도달하지 못한 두 가지 원인이 있으며, 다음 절에서 다룹니다.
 
 생성 속도는 컨텍스트가 8배 늘어나는 동안 29%만 떨어졌습니다.
 
@@ -503,6 +538,25 @@ MoE 오프로드에서 전문가 가중치는 ubatch당 한 번 RAM에서 읽혀
 기본값 4슬롯에서는 세션 로그의 슬롯 선택 18회 중 **14회가 LCP 매칭 실패 후 LRU 폴백**이었습니다. 18~25k짜리 서로 다른 대화 4개가 동시에 올라가 **87k 수요가 65k 통합 KV 풀을 초과**하며 서로를 축출한 것입니다. Cline은 대화 1개 + 소형 보조 요청만 동시에 보내므로 2슬롯이면 충분하고, 정확히 2개일 때는 LRU 특성상 보조 요청이 항상 *반대쪽* 슬롯으로 가서 메인 접두부가 보존됩니다. 슬롯 수는 어느 쪽이든 VRAM에 영향이 없습니다.
 
 > **`-np N`을 주면 통합 KV가 조용히 꺼집니다.** `--kv-unified`의 기본값이 "슬롯 수가 auto일 때만 활성"이라서, `-np 2`만 주면 `-c 65536`이 슬롯당 32768이 되고 컨텍스트 윈도우를 61440으로 설정한 클라이언트가 그대로 깨집니다. 반드시 `-kvu`를 함께 주세요.
+
+### 슬롯 유사도 `-sps` — 그래도 남는 멈춤
+
+장시간 관측하니 40~80초 재처리가 다시 나타났습니다. 원인은 둘이고, 고칠 수 있는 건 하나뿐입니다.
+
+**압축 — 회피 불가.** `contextWindow` 126,976에서 Cline은 약 114k에 압축을 겁니다. 설계대로입니다(실측: 117,052 → 58,588토큰, 115,482 → 35,464토큰). 압축은 대화 앞부분을 요약본으로 갈아끼우므로 접두부가 바뀌고 캐시가 무효화됩니다. 위 `--cache-reuse` A/B에서 이것이 우회 불가임을 코드 수준으로 확인했습니다.
+
+**거의 무관한 프롬프트가 살아 있는 슬롯을 차지 — 고칠 수 있음.** 그날 가장 큰 스톨 두 건의 직전 로그입니다.
+
+```
+f_sim_best = 0.103 (> 0.100 thold)  → 53,543토큰 재처리, 76.5초
+f_sim_best = 0.100 (> 0.100 thold)  → 55,876토큰 재처리, 81.9초
+```
+
+유사도 10%입니다. `--slot-prompt-similarity` 기본값이 **0.10**이라, 시스템 프롬프트 말고는 공유하는 게 없는 요청도 6만 토큰 캐시를 든 슬롯을 차지할 자격이 생기고, 그대로 파괴합니다. 한나절 슬롯 선택 178회 중 156회는 정상(0.9 이상)이었고 0.2 미만은 3회뿐이었지만, 그 3회가 최악의 스톨을 만들었습니다.
+
+임계를 `0.5`로 올리면 그런 요청은 반대쪽 슬롯으로 가고, 살아 있는 캐시는 보존되어 원래 대화가 돌아왔을 때 재처리를 면합니다. 그 요청 자체의 재처리 비용은 그대로이고, 달라지는 건 **6만 토큰 캐시를 같이 끌고 내려가지 않는다**는 점입니다.
+
+더 높이지는 마세요. 0.5~0.9 구간(여기서는 178회 중 16회)은 부분 재사용이 여전히 이득입니다. 적용 후 중간 구간 재처리가 늘어난다면 0.3으로 낮추는 게 맞습니다.
 
 ### 컨텍스트 크기 `-c`
 
