@@ -393,6 +393,22 @@ Full measurement logs, per-flag reasoning, and the complete benchmark appendix a
 전체 실행 스크립트: [`scripts/run-server.sh`](scripts/run-server.sh)
 systemd 유저 서비스 유닛: [`scripts/llama-server.service`](scripts/llama-server.service)
 
+### 측정 재현
+
+이 문서의 수치는 아래 두 스크립트로 나온 것이며, 그대로 다시 돌릴 수 있습니다.
+
+```bash
+# 고정 프롬프트(scripts/bench-prompt.txt, 약 22K 토큰) 벤치마크
+systemctl --user stop llama-server
+./scripts/bench-model.sh ~/models/Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf 33 2048 131072 mylabel
+systemctl --user start llama-server
+
+# 실제 세션 저널 집계 (세션 시작 시각을 인자로)
+./scripts/aggregate-session.sh "2026-08-22 18:15:21"
+```
+
+`bench-model.sh`는 `cache_prompt:false`로 3회 반복해 중앙값을 내므로 콜드 프롬프트 처리 속도를 재고, `aggregate-session.sh`는 systemd 저널에서 캐시 적중률과 재처리 비용을 뽑습니다. 위 "튜닝 전후 실사용 비교" 표가 후자의 출력입니다.
+
 ## 성능 병목 분석 — 이 구성의 속도를 결정하는 것은 GPU가 아니라 RAM 대역폭
 
 MoE 오프로드 구성에서는 매 토큰마다 CPU가 담당한 전문가 레이어의 가중치를 RAM에서 읽어와야 합니다. 이 시스템에서는 그것이 명확한 병목이며, 세 가지 독립적인 측정이 모두 같은 결론을 가리킵니다.

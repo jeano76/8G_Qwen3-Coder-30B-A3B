@@ -1,0 +1,1044 @@
+# Running Qwen3-Coder-30B-A3B on an 8GB GPU
+
+**English** | [한국어](#8gb-vram에서-qwen3-coder-30b-a3b-로컬-코딩-어시스턴트-구동하기)
+
+Measured notes and the final configuration for running a 30B-class coding LLM at usable speed on a single 8GB GPU. Every number below was measured on the machine described here — including the approaches that turned out to be slower.
+
+**Result: 45.07 tok/s generation, 438.73 t/s prompt processing**, running a 30.5B-parameter model on a GPU that cannot hold it.
+
+## Hardware
+
+| Component | Spec |
+|---|---|
+| GPU | NVIDIA GeForce RTX 2070 SUPER (8GB VRAM, ~7.6GB usable) |
+| CPU | Intel Core i5-12400F (6 cores / 12 threads) |
+| RAM | 32GB DDR5-5600, **single channel** (one DIMM populated; 29.1 GB/s measured) |
+| OS | Ubuntu 22.04.5 LTS, kernel 6.8.0 |
+| CUDA | Driver 580.173.02 (CUDA 13.0), Toolkit 12.6 |
+| Runtime | [llama.cpp](https://github.com/ggml-org/llama.cpp), CUDA backend built from source (`-DCMAKE_CUDA_ARCHITECTURES=75`) |
+
+## Why a MoE model
+
+Dense models were measured first, on the same prompt and hardware:
+
+| Model | Setup | Generation |
+|---|---|---:|
+| Qwen2.5-Coder-32B Q4_K_M | dense, 20 layers on GPU + speculative decoding | 6.1 tok/s |
+| Qwen2.5-Coder-14B Q4_K_M | dense, 41 layers on GPU | 15–18 tok/s |
+| Qwen2.5-Coder-7B Q5_K_M | dense, fully on GPU | 58–64 tok/s |
+| **Qwen3-Coder-30B-A3B UD-Q3_K_XL** | **MoE, partial expert offload** | **43.2 tok/s** |
+
+The 32B dense model was unusable at 6 tok/s; the 7B was fast but produced buggier code. Qwen3-Coder-30B-A3B has 30.5B total parameters but activates only ~3B per token, so it carries 30B-class knowledge at roughly 3B-class compute.
+
+llama.cpp's `--n-cpu-moe` then keeps only part of the expert FFN weights in system RAM while attention and the rest stay on the GPU. That is what makes a 13.81GB model run on 8GB of VRAM.
+
+## Final configuration
+
+```bash
+llama-server \
+  -m Qwen3-Coder-30B-A3B-Instruct-UD-Q3_K_XL.gguf \
+  -ngl 99 -ncmoe 32 -fa on -t 6 -lm none \
+  -c 36864 -ctk q8_0 -ctv q8_0 \
+  --temp 0.7 --top-p 0.8 --top-k 20 --repeat-penalty 1.05 --min-p 0.0 \
+  --host 127.0.0.1 --port 8080
+```
+
+| Flag | Why |
+|---|---|
+| `-ncmoe 32` | Keep 32 layers' expert weights on the CPU; everything else on the GPU |
+| `-lm none` | Load fully into RAM instead of mmap — removes page-fault overhead on offloaded tensors (prompt processing +34%) |
+| `-t 6` | Physical cores only. Using all 12 threads is **11% slower** (36.1 → 32.4 tok/s) |
+| `-fa on` | Flash Attention — free speed, no quality cost |
+| `-ctk/-ctv q8_0` | 8-bit KV cache. Do **not** drop V to `q4_0` on this GPU (see below) |
+| sampling flags | Qwen3-Coder's recommended values. llama-server defaults (temp 0.80 / top_p 0.95 / top_k 40) are too loose for agent coding and invite wrong APIs and imports |
+
+> The checked-in [`scripts/run-server.sh`](scripts/run-server.sh) uses `-c 65536 -ncmoe 38` instead,
+> because this machine also hosts a [Hermes Agent](https://github.com/NousResearch/hermes-agent)
+> that refuses to start below a 64K context window. That trades away ~9% of generation throughput
+> (41.3 vs 45.3 tok/s). **For a Cline-only setup the values above are the faster choice.**
+
+Quantization went Q4_K_M (18.56GB) → IQ4_XS (16.38GB) → **UD-Q3_K_XL (13.81GB)**. Because generation is bandwidth-bound here, each shrink both frees VRAM (`ncmoe` 36 → 34 → 32) and cuts per-token RAM traffic, so speed rose at every step.
+
+## The bottleneck is RAM bandwidth, not the GPU
+
+Three independent measurements agree:
+
+1. **Thread scaling saturates early.** 2→3 cores gives +30%, but 5→6 cores gives only **+1.5%** — spare CPU compute that speed does not follow.
+2. **Cost per offloaded expert layer is flat at 0.448 ms** across `ncmoe` 34/40/48. At `ncmoe=32`, roughly 60% of each token's time is spent reading expert weights from RAM.
+3. **Measured sequential read bandwidth is 29.1 GB/s** — about 65% of the 44.8 GB/s theoretical peak for single-channel DDR5-5600.
+
+The practical consequence: this machine runs **single channel**, with one DIMM in `Controller0-DIMM1` and `Controller1` empty. Adding a matching module should roughly halve the CPU-side time. Adding CPU cores would not help at all.
+
+## What did not work
+
+| Attempt | Result |
+|---|---|
+| Speculative decoding with a small draft model | Effective on the 32B dense model, but **halved throughput to 17.3 tok/s** on the MoE — the draft model competes for the same CPU cores already saturated by expert offload |
+| `q4_0` V cache | Buys +33% context at the same `ncmoe`, but runs **13.5% slower** (44.8 → 38.8 tok/s). Turing (sm_75) has no optimized flash-attention path for `q4_0` V, so it pays full dequantization cost |
+| Per-tensor `-ot` offload | ~3% faster at small context, but OOMs at the production context — VRAM is already saturated |
+| Reducing `--parallel` | No VRAM freed; the server uses a unified KV cache across slots |
+| `--cache-reuse 256` | **Exactly zero effect** — cache-hit counts were byte-identical with and without it in an A/B. Its reuse scan only advances the prompt-side pointer on a match, so the *inserted* summary that Cline's condense produces stops it before it can reach the unchanged recent messages. It absorbs *deletions* from the cache, not insertions (see the Korean section for the measurement) |
+
+## Client setup (Cline)
+
+Point any OpenAI-compatible client at `http://127.0.0.1:8080/v1`. For Cline, **`contextWindow` must be set** — without it Cline grows conversations unbounded until the server hard-errors:
+
+```
+error: request (41403 tokens) exceeds the available context size (36864 tokens)
+```
+
+Raising `-c` is the wrong fix: requests kept growing (25544 → 41403), and a larger context forces `ncmoe` up, costing 4–11% throughput. Cline condenses at 0.9 / 0.7 of `contextWindow` once told, so setting it leaves the fast server config untouched:
+
+```json
+{
+  "provider": "openai-compatible",
+  "baseUrl": "http://127.0.0.1:8080/v1",
+  "apiKey": "sk-no-key-required",
+  "model": "Qwen3-Coder-30B-A3B-Instruct-UD-Q3_K_XL.gguf",
+  "contextWindow": 36864,
+  "maxTokens": 4096
+}
+```
+
+Keep `contextWindow` in sync with the server: set it to `-c` minus `maxTokens`. With the checked-in `-c 65536` script that means `61440`, not the `36864` shown above.
+
+Note that Cline only sends sampling parameters when they are explicitly configured, so the server-side defaults above are what it actually gets.
+
+## Caveats
+
+- This is a compromise shaped by 8GB of VRAM. With a larger card the model fits entirely in VRAM, `--n-cpu-moe` drops toward 0, and the RAM-bandwidth bottleneck disappears.
+- Generated code still needs review. Bugs were found in the 7B and 14B output (missing imports, non-existent parameter names); 30B-A3B was the most reliable but not infallible.
+- `llama-cli` / `llama-bench` and `llama-server` use different default context and batch sizes, so the same `-ncmoe` can fit in one and OOM in another. Leave headroom when changing values.
+
+Full measurement logs, per-flag reasoning, and the complete benchmark appendix are in the Korean document below.
+
+---
+
+# 8GB VRAM에서 Qwen3-Coder-30B-A3B 로컬 코딩 어시스턴트 구동하기
+
+[English](#running-qwen3-coder-30b-a3b-on-an-8gb-gpu) | **한국어**
+
+단일 8GB급 GPU(NVIDIA RTX 2070 SUPER)에서 실사용 가능한 속도로 로컬 코딩 LLM을 돌리기 위한 실험 기록과 최종 설정입니다. 여러 모델 크기(7B/14B/32B/MoE)를 직접 벤치마크하고, 8GB VRAM 제약 아래 속도와 코드 품질의 균형점을 찾았습니다.
+
+## 하드웨어 / 환경
+
+| 항목 | 사양 |
+|---|---|
+| GPU | NVIDIA GeForce RTX 2070 SUPER (8GB VRAM, 실사용 가능 ~7.6GB) |
+| CPU | Intel Core i5-12400F (6코어 / 12스레드) |
+| RAM | 32GB DDR5-5600 (**싱글채널** — 1개 슬롯만 사용, 실측 대역폭 29.1 GB/s) |
+| OS | Ubuntu 22.04.5 LTS, Kernel 6.8.0 |
+| CUDA | Driver 580.173.02 (CUDA 13.0), Toolkit 12.6 |
+| 추론 엔진 | [llama.cpp](https://github.com/ggml-org/llama.cpp) (CUDA 백엔드, `-DCMAKE_CUDA_ARCHITECTURES=75`로 소스 빌드) |
+
+## 모델 비교 벤치마크
+
+동일 프롬프트("REST API 클라이언트 클래스 작성: 재시도/백오프/레이트리미팅 포함")로 실측한 결과입니다.
+
+| 모델 | 방식 | 생성 속도 | 비고 |
+|---|---|---:|---|
+| Qwen2.5-Coder-32B-Instruct Q4_K_M | 덴스, ngl=20 + 추측 디코딩(0.5B draft) | 6.06 tok/s | 품질은 좋으나 실사용엔 너무 느림 |
+| Qwen2.5-Coder-14B-Instruct Q4_K_M | 덴스, ngl=41 | 15.1~18.3 tok/s | 논리 버그 1건 발견 |
+| Qwen2.5-Coder-7B-Instruct Q5_K_M | 덴스, 전체 GPU 오프로드 | 58.4~64.4 tok/s | 가장 빠르지만 버그 2건(임포트 누락 등) |
+| Qwen3-Coder-30B-A3B-Instruct Q4_K_M | MoE (30B 총/3B 활성), `-ncmoe 36` | 28.7~38.4 tok/s | MoE 채택 — 속도와 코드 구조 완성도의 최적 균형점 |
+| Qwen3-Coder-30B-A3B-Instruct IQ4_XS | 동일 모델, `-ncmoe 34` | 37.8 tok/s | 같은 모델 더 작은 양자화 → ncmoe 감소 |
+| **Qwen3-Coder-30B-A3B-Instruct UD-Q3_K_XL** | **동일 모델, `-ncmoe 32`** | **43.2 tok/s** | **최종 채택** — 대역폭 병목 구조상 양자화를 낮출수록 빨라짐(아래 분석 참고) |
+
+> 위 3개 MoE 행은 모두 같은 모델이며 양자화만 다릅니다. `-c 36864` 운용 컨텍스트 기준 실측이라 벤치마크 기본 컨텍스트 수치보다 낮게 나옵니다.
+
+### 왜 MoE(Qwen3-Coder-30B-A3B)인가
+
+- 총 파라미터는 30B로 지식/추론 용량은 32B 덴스급이지만, 토큰당 실제 활성화되는 파라미터는 3B뿐이라 연산량은 훨씬 작음
+- `llama.cpp`의 `--n-cpu-moe`(`-ncmoe`) 옵션으로 전문가(expert) FFN 가중치 일부만 CPU/RAM에 남기고 나머지(어텐션 등)는 GPU에 올리는 하이브리드 오프로드가 가능 — 8GB VRAM에서도 30B급 모델을 돌릴 수 있는 핵심 트릭
+- 14B 덴스보다 2.5배 빠르면서, 커스텀 예외 클래스·dataclass·로깅까지 구조화된 코드를 생성하는 등 지금까지 테스트한 것 중 가장 체계적인 결과물을 냄
+
+### 추측 디코딩(Speculative Decoding)에 대한 참고
+
+- 32B 덴스 모델에는 소형 드래프트 모델(Qwen2.5-Coder-0.5B)이 유효했음(6.06 tok/s, 품질 손실 없음)
+- 그러나 Qwen3-Coder-30B-A3B에는 **역효과**였음 — MoE 오프로드로 이미 CPU가 바쁜 상태에서 드래프트 모델까지 같은 CPU 코어를 두고 경쟁하며 오히려 17.3 tok/s로 느려짐. 이 조합에서는 추측 디코딩을 쓰지 않는 것이 최적.
+
+## 최종 설정
+
+```bash
+~/llama.cpp/build-cuda/bin/llama-server \
+  -m ~/models/Qwen3-Coder-30B-A3B-Instruct-UD-Q3_K_XL.gguf \
+  -ngl 99 -ncmoe 32 -fa on -t 6 -lm none \
+  -c 36864 -ctk q8_0 -ctv q8_0 \
+  --temp 0.7 --top-p 0.8 --top-k 20 --repeat-penalty 1.05 --min-p 0.0 \
+  --host 127.0.0.1 --port 8080
+```
+
+- **양자화: UD-Q3_K_XL (13.81GB)**. Q4_K_M(18.56GB) → IQ4_XS(16.38GB) → UD-Q3_K_XL 순으로 내려왔음. 아래 "성능 병목 분석"에서 밝혔듯 **생성 속도가 메모리 대역폭에 묶여 있어서, 전문가 가중치가 작아지는 것이 그대로 속도가 됨**. IQ4_XS 대비 파일 16% 감소 → `ncmoe` 34→32 (GPU에 2레이어 더) → **생성 속도 +14~19%**. Unsloth UD(Dynamic) 계열은 중요 텐서를 고정밀로 유지해 3비트대에서도 품질 저하를 최소화함.
+- `-ngl 99 -ncmoe 32`: 최대한 GPU에 올리되, 전문가 레이어 32개는 CPU에 남김
+- `-ctk q8_0 -ctv q8_0`: KV 캐시 8비트 양자화 — 품질 손실 거의 없이 여유 확보, 프롬프트 처리 속도 34% 향상(360→483 t/s)의 부수 효과
+- `-lm none`: `mmap` 대신 전량 RAM 직접 로드 — CPU 오프로드 텐서의 페이지 폴트 오버헤드 제거
+- `-fa on`: Flash Attention, 품질 손실 없이 무료 속도 향상
+- `-c 36864`: Cline처럼 시스템 프롬프트가 긴 툴에서 25544토큰까지 요청이 커지는 걸 확인(`request (25544 tokens) exceeds the available context size (24576 tokens)`) → IQ4_XS + ncmoe=34 조합으로 36864까지 확장(요구치 대비 44% 여유), 생성 속도는 오히려 34.9 tok/s로 준수함
+- `-t 6`: 물리 코어 수. 하이퍼스레딩(12)을 켜면 오히려 생성 속도가 11% 느려짐(36.1→32.4 tok/s, 캐시 경합 추정) — 실측으로 확인
+- **`--temp 0.7 --top-p 0.8 --top-k 20 --repeat-penalty 1.05 --min-p 0.0`**: Qwen3-Coder 공식 권장 샘플링 값. llama-server 기본값(temp 0.80 / top_p 0.95 / top_k 40 / repeat 1.00)은 코딩 에이전트용으로 지나치게 무작위해서 잘못된 API·임포트를 생성할 여지가 큽니다. 속도 비용은 0이므로 반드시 지정하세요. **Cline은 샘플링 값을 명시 설정했을 때만 요청에 실어 보내므로**(전부 optional), 클라이언트에서 따로 지정하지 않으면 이 서버 기본값이 그대로 적용됩니다.
+- **KV 캐시를 `q4_0`으로 더 낮추는 것은 이 GPU에서 역효과**였음. `-ctv q4_0`은 컨텍스트를 36864→49152로 늘려주지만(같은 `ncmoe`에서), 동일 조건 비교에서 생성 속도가 44.8→38.8 tok/s로 **13.5% 느려집니다**. Turing(sm_75)에 q4_0 V캐시용 최적화된 flash-attention 경로가 없어 역양자화 비용을 그대로 무는 것으로 보입니다. K/V 모두 `q8_0` 유지가 정답.
+- 참고: `--parallel`(동시 슬롯 수)은 `kv_unified` 모드라 슬롯 수를 줄여도 VRAM 여유가 안 생김. 데스크톱 GPU 점유(Xorg/GNOME ~220MB)도 회수 시도했으나 이 CPU(i5-12400F "F"모델)는 내장 그래픽이 없어 구조적으로 불가능 — 컨텍스트를 늘리려면 `-ncmoe`를 올리거나 더 작은 양자화를 쓰는 것만 유효했음
+
+> **참고 — 체크인된 스크립트는 `-c 65536 -ncmoe 38`입니다.** 이 머신에 [Hermes Agent](https://github.com/NousResearch/hermes-agent)를
+> 함께 올렸는데, Hermes는 컨텍스트 윈도우가 64K 미만이면 실행 자체를 거부합니다
+> (`has a context window of 36,864 tokens, which is below the minimum 64,000 required`).
+> 아래 표 기준 생성 속도를 약 9% 내주는 선택입니다(45.3 → 41.3 tok/s).
+> **Cline만 쓴다면 위 `-c 36864 -ncmoe 32`가 더 빠릅니다.**
+
+전체 실행 스크립트: [`scripts/run-server.sh`](scripts/run-server.sh)
+systemd 유저 서비스 유닛: [`scripts/llama-server.service`](scripts/llama-server.service)
+
+## 성능 병목 분석 — 이 구성의 속도를 결정하는 것은 GPU가 아니라 RAM 대역폭
+
+MoE 오프로드 구성에서는 매 토큰마다 CPU가 담당한 전문가 레이어의 가중치를 RAM에서 읽어와야 합니다. 이 시스템에서는 그것이 명확한 병목이며, 세 가지 독립적인 측정이 모두 같은 결론을 가리킵니다.
+
+**1) 스레드 스케일링이 조기 포화**
+
+| 스레드 | 2 | 3 | 4 | 5 | 6 |
+|---|---|---|---|---|---|
+| tg128 (tok/s) | 25.0 | 32.4 | 36.7 | 38.1 | 38.7 |
+| 직전 대비 | — | +30% | +13% | +3.7% | **+1.5%** |
+
+5→6코어에서 겨우 1.5%. CPU 연산 자원이 남는데도 속도가 오르지 않음 = 메모리 버스 포화.
+
+**2) CPU 전문가 레이어당 비용이 완전히 선형**
+
+`-ncmoe` 34 / 40 / 48 실측(IQ4_XS): 39.12 / 35.40 / 31.42 tok/s
+→ 토큰당 25.56 / 28.25 / 31.83 ms → **레이어당 일정하게 0.448 ms**
+
+여기서 시간 분해가 나옵니다. `ncmoe=34`일 때 토큰당 25.6ms 중 **15.2ms(약 60%)가 CPU 전문가 가중치 읽기**, 나머지 10.3ms가 GPU 연산 + 고정 오버헤드입니다.
+
+**3) 실측 메모리 대역폭이 이론치와 일치**
+
+`gcc -O3 -march=native -fopenmp` 로 컴파일한 순차 읽기 벤치마크: **29.1 GB/s**.
+DDR5-5600 싱글채널 이론 피크 44.8 GB/s의 약 65%로, 전형적인 실측 효율입니다.
+
+### 실용적 결론
+
+- **더 낮은 비트 양자화가 그대로 속도가 됨.** 대역폭 병목이므로 전문가 가중치 크기 감소분이 거의 그대로 생성 속도로 환산됩니다. Q4_K_M → IQ4_XS → UD-Q3_K_XL로 내려오며 속도가 계속 올랐고, 이것이 최종 설정에서 3비트대 양자화를 택한 이유입니다.
+- **RAM을 듀얼채널로 만들면 큰 이득이 예상됨.** 이 머신은 32GB 모듈이 `Controller0-DIMM1` 한 곳에만 꽂혀 있어 싱글채널로 동작합니다(`Controller1` 슬롯 2개 공석). 동일 규격 모듈을 하나 더 추가해 대역폭이 2배가 되면 CPU 구간 15.2ms → 약 8.5ms로 줄어 **50 tok/s 이상**이 기대됩니다. 단, VRAM이 큰 GPU로 교체해 모델 전체가 VRAM에 올라가면 이 병목 자체가 사라지므로, GPU 업그레이드 계획이 있다면 우선순위를 비교해 판단하세요.
+- **CPU 코어 수를 늘려도 소용없음.** 위 스케일링 곡선이 보여주듯 이 워크로드는 연산이 아니라 대역폭에 묶여 있습니다.
+- **`-ot` 텐서 단위 세밀 오프로드는 이 구성에서 무의미했음.** 작은 컨텍스트에서는 `-ncmoe`보다 약 3% 빨랐지만(레이어 단위보다 촘촘하게 VRAM을 채울 수 있어서), 실제 운용 컨텍스트(36864)에서는 이미 VRAM이 포화라 모든 변형이 OOM이었습니다. 참고로 `-ot` 구분자는 `llama-bench`가 `;`, `llama-cli`/`llama-server`가 `,`로 서로 다릅니다.
+
+## 상시 구동 (systemd)
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp scripts/llama-server.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now llama-server.service
+loginctl enable-linger $(whoami)   # 로그아웃 후에도 계속 구동
+```
+
+OpenAI 호환 API가 `http://127.0.0.1:8080/v1`에서 제공됩니다.
+
+## VSCode 연동 (Continue.dev)
+
+1. VSCode + [Continue.dev](https://marketplace.visualstudio.com/items?itemName=Continue.continue) 확장 설치
+2. `~/.continue/config.yaml`에 아래 내용 추가:
+
+```yaml
+models:
+  - name: Qwen3-Coder-30B-A3B (local)
+    provider: openai
+    model: qwen3-coder-30b-a3b
+    apiBase: http://127.0.0.1:8080/v1
+    apiKey: none
+    contextLength: 36864
+    capabilities:
+      - tool_use   # 빠뜨리면 Continue.dev가 파일 읽기 등 에이전트/툴 기능을 아예 시도하지 않음
+    roles:
+      - chat
+      - edit
+      - apply
+      - autocomplete
+```
+
+## Cline 연동
+
+- API Provider: `OpenAI Compatible`
+- Base URL: `http://127.0.0.1:8080/v1`
+- API Key: 아무 값이나(서버가 검사하지 않음)
+- Model: `Qwen3-Coder-30B-A3B-Instruct-UD-Q3_K_XL.gguf`
+
+### 반드시 `contextWindow`를 지정할 것 — "토큰 초과" 에러의 진짜 원인
+
+Cline에 컨텍스트 한계를 알려주지 않으면 대화를 무한정 쌓다가 서버에서 하드 에러가 납니다:
+
+```
+error: request (41403 tokens) exceeds the available context size (36864 tokens)
+```
+
+`-c` 값을 계속 올려주는 건 두더지잡기입니다(25544 → 41403으로 계속 커짐). **Cline은 `contextWindow` 값을 받으면 0.9 / 0.7 임계치로 대화를 자동 압축(condense)** 하므로, 서버를 건드리지 말고 클라이언트에 한계를 알려주는 것이 정답입니다. 서버 설정을 그대로 두므로 **속도 손실이 전혀 없습니다.**
+
+Cline CLI를 쓴다면 `~/.cline/data/settings/providers.json`:
+
+```json
+{
+  "providers": {
+    "openai-compatible": {
+      "settings": {
+        "provider": "openai-compatible",
+        "apiKey": "sk-no-key-required",
+        "model": "Qwen3-Coder-30B-A3B-Instruct-UD-Q3_K_XL.gguf",
+        "baseUrl": "http://127.0.0.1:8080/v1",
+        "contextWindow": 36864,
+        "maxTokens": 4096
+      }
+    }
+  }
+}
+```
+
+수정 후 Cline을 완전히 종료했다 재실행해야 반영됩니다(실행 중이면 종료 시 덮어씁니다).
+
+`contextWindow`는 서버 `-c` 값에서 `maxTokens`를 뺀 값으로 맞추세요. 체크인된 `-c 65536` 스크립트를 쓴다면 위 예시의 `36864`가 아니라 **`61440`** 입니다. 너무 작게 잡으면 압축이 잦아져 오히려 느려집니다(바로 아래 절 참고).
+
+참고로 서버 쪽에서 컨텍스트를 늘려 해결하려면 `ncmoe`를 올려야 해서 속도를 내줘야 합니다(UD-Q3_K_XL 기준 실측):
+
+| 컨텍스트 | 필요 ncmoe | tg128 | 손실 |
+|---|---:|---:|---:|
+| **36864 (채택)** | **32** | **45.3** | — |
+| 49152 | 34 | 43.6 | −4% |
+| 65536 | 38 | 41.3 | −9% |
+| 73728 (한계) | 40 | 40.3 | −11% |
+
+### 프롬프트 캐시 동작 — 느려지는 진짜 지점
+
+llama-server의 접두부 캐시는 **순차 대화에서 거의 완벽하게 동작**합니다. 22205토큰짜리 시스템 프롬프트로 3턴을 이어가며 측정한 결과:
+
+| 턴 | 새로 처리한 토큰 | 소요 | 캐시 재사용 |
+|---|---:|---:|---:|
+| 1회차 | 22205 | 38539 ms | 0 |
+| 2회차 | 14 | 177 ms | 22206 |
+| 3회차 | 15 | 181 ms | 22221 |
+
+3회차 캐시 히트율 **99.9%**, 재처리 시간 38.5초 → 0.18초.
+
+따라서 체감 지연의 원인은 tok/s가 아니라 **캐시가 통째로 무효화되는 순간**입니다. 운영 로그상 슬롯 선택의 27%(56회 중 15회)가 캐시 미스였고, 한 번의 대가가 매우 큽니다:
+
+| 재처리 토큰 | 소요 시간 |
+|---:|---:|
+| 30018 | 76.1 초 |
+| 26681 | 69.3 초 |
+| 14543 | 43.1 초 |
+
+캐시 무효화는 주로 **Cline이 대화를 압축할 때** 일어납니다 — 앞부분 메시지가 요약본으로 교체되면서 접두부 자체가 바뀌기 때문에 구조적으로 회피할 수 없습니다. 그래서 `contextWindow`를 지나치게 작게 잡으면 압축이 잦아져 오히려 느려집니다. 서버 `-c` 값보다 약간 작게, 그러나 너무 작지 않게 잡는 것이 좋습니다.
+
+### `--cache-reuse`로는 해결되지 않음 (A/B 실측)
+
+llama-server의 `--cache-reuse N`은 접두부가 어긋나도 일치하는 청크를 찾아 KV를 새 위치로 이동시켜
+재사용하는 옵션입니다. 위의 압축 캐시 무효화를 완화할 유력한 후보로 보여서, 동일 워크로드
+(시스템 5,040토큰 + 대화 20,192토큰)로 서버를 두 번 기동해 A/B 했습니다.
+
+| 턴 | 없음 (재사용/재처리) | `--cache-reuse 256` (재사용/재처리) |
+|---|---:|---:|
+| 1. 최초 (cold) | 0 / 20,192 — 0% | 0 / 20,192 — 0% |
+| 2. 순차 대화 | 20,192 / 23 — 99.9% | 20,192 / 23 — 99.9% |
+| **3. 압축 직후** | **5,040 / 4,603 — 52.3%** | **5,040 / 4,603 — 52.3%** |
+| 4. 압축 후 순차 | 9,643 / 23 — 99.8% | 9,643 / 23 — 99.8% |
+
+**네 턴 모두 토큰 단위까지 완전히 동일합니다.** 효과가 정확히 0입니다.
+(2번 턴의 99.9%는 앞 절의 측정을 그대로 재현한 값입니다.)
+
+원인은 구현에 있습니다. `tools/server/server-context.cpp`의 `n_cache_reuse` 블록은 포인터 두 개로
+도는데, 캐시 쪽 `head_c`는 1씩 전진하지만 **프롬프트 쪽 `head_p`는 매치가 성립할 때만 전진**합니다.
+
+```
+while (head_c < cache.size() && head_p < prompt.size()) {
+    n_match = (캐시[head_c..] 와 프롬프트[head_p..] 의 연속 일치 길이)
+    if (n_match >= n_cache_reuse) { KV 시프트; head_c += n_match; head_p += n_match; }
+    else                          { head_c += 1; }   // head_p 는 그대로
+}
+```
+
+압축 시점에 `head_p`는 새로 삽입된 **요약문의 첫 토큰**에 놓입니다. 그 요약문은 캐시에 존재한 적이
+없으니 `n_cache_reuse` 이상의 일치가 영영 성립하지 않고, 루프는 `head_c`만 끝까지 훑다가 끝납니다.
+요약문 바로 뒤에 원문 그대로 남아 있는 최근 메시지 수천 토큰조차 **포인터가 요약문에 묶여
+도달하지 못합니다**.
+
+즉 이 옵션이 흡수할 수 있는 것은 캐시 내용의 **삭제**(뒤 내용이 앞으로 당겨지는 경우)뿐이고,
+Cline의 압축처럼 요약문이 **삽입**되는 변형은 원리적으로 대상이 아닙니다. 앞 절의 "구조적으로
+회피할 수 없다"가 코드 수준에서 확인된 셈입니다.
+
+실질적인 완화책은 여전히 **`contextWindow`를 서버 `-c`에 최대한 근접하게 잡아 압축 횟수 자체를
+줄이는 것**뿐입니다.
+
+## 전체 벤치마크 로그
+
+이 프로젝트 진행 중 실측한 모든 조건과 수치입니다. 표기: `pp512` = 프롬프트 처리(t/s), `tg128` = 생성 속도(tok/s). 별도 표기 없으면 `llama-bench` 기준(작은 컨텍스트), "프로덕션"은 실제 운용 컨텍스트(최종 36864)에서 API로 실측한 값입니다.
+
+### Qwen2.5-Coder-32B-Instruct Q4_K_M (덴스, 18.48GB)
+
+| 조건 | pp512 | tg128 | 비고 |
+|---|---:|---:|---|
+| ngl=0 (전체 CPU) | 139.0 | 2.11 | |
+| ngl=8 | 147.7 | 2.44 | |
+| ngl=12 | 155.6 | 2.58 | |
+| ngl=16 | 161.1 | 2.76 | |
+| ngl=20 | 168.1 | 2.96 | 8GB VRAM에서 최대 오프로드 |
+| ngl=24 이상 | — | OOM | |
+| ngl=20 + 추측 디코딩(0.5B draft, CPU) | — | 4.44~6.06 | 수락률 47.9~72.9%, 프롬프트에 따라 편차 큼 |
+
+### Qwen2.5-Coder-14B-Instruct Q4_K_M (덴스, 8.37GB)
+
+| 조건 | pp512 | tg128 | 비고 |
+|---|---:|---:|---|
+| ngl=20 | 457.9 | 7.97 | |
+| ngl=30 | 556.0 | 10.92 | |
+| ngl=40 | 706.8 | 17.54 | |
+| ngl=41 | — | 18.27 | 최대 오프로드(bench 기준) |
+| ngl=42 이상 | — | OOM | |
+| 프로덕션 (ngl=38, 안전마진) | — | **15.1** | 실제 코딩 데모 |
+
+### Qwen2.5-Coder-7B-Instruct Q5_K_M (덴스, 5.07GB, 전체 GPU 오프로드)
+
+| 조건 | pp512 | tg128 | 비고 |
+|---|---:|---:|---|
+| ngl=99 (bench) | 2045.8 | 64.44 | |
+| 프로덕션 | 1083.5 | **58.4** | 실제 코딩 데모 |
+
+### Qwen3-Coder-30B-A3B-Instruct — MoE 오프로드 튜닝 (30.53B 총 / 3B 활성)
+
+**양자화별 ncmoe 스윕** (컨텍스트·KV캐시 설정에 따라 같은 ncmoe도 결과가 다름, 각 행 옆에 조건 표기)
+
+| 양자화(크기) | ncmoe | 조건 | tg128 | 비고 |
+|---|---:|---|---:|---|
+| Q4_K_M (18.56GB) | 48 | 기본 ctx | 27.67 | |
+| Q4_K_M | 40 | 기본 ctx | 32.48 | |
+| Q4_K_M | 32 | 기본 ctx | 37.62 | 8GB에서 최대 오프로드 |
+| Q4_K_M | 32 | + KV q8_0 | 38.37 | |
+| Q4_K_M | 32 | + KV q8_0 + `-lm none` | 37.85 | pp512은 360→483으로 +34%, tg는 동일 |
+| Q4_K_M | 24/16/8/0 | — | OOM | |
+| Q4_K_M | 34 | ctx=8192, 프로덕션 초기값 | **37.5** | 최초 프로덕션 설정 |
+| Q4_K_M | 34 | ctx=24576(스레드=6) | 36.14 | |
+| Q4_K_M | 34 | ctx=24576(스레드=12) | 32.38 | 하이퍼스레딩 −11% |
+| Q4_K_M | 36 | ctx=32768 | 28.7 | Cline 25544토큰 요구 대응, ncmoe↑ |
+| Q4_K_M | 38 | ctx=32768 | 31.2 | |
+| Q4_K_M | 40 | ctx=32768 | 30.1 | |
+| **IQ4_XS (16.38GB)** | 28/30/32 | ctx=32768 | OOM | |
+| IQ4_XS | 34 | ctx=32768 | 29.3 | |
+| IQ4_XS | 34 | ctx=36864 | 34.9 | |
+| IQ4_XS | 40 | 대역폭 측정용(소형 ctx) | 35.40 | |
+| IQ4_XS | 48 | 대역폭 측정용(소형 ctx) | 31.42 | |
+| IQ4_XS | 34 | 대역폭 측정용(소형 ctx) | 39.12 | ncmoe당 0.448ms로 완전 선형 확인 |
+| IQ4_XS | — | `-ot` 세밀 오프로드(소형 ctx) | 40.27~40.98 | 실제 ctx=36864에선 전부 OOM |
+| IQ4_XS | 34 | 프로덕션(ctx=36864) | **37.8** | |
+| **UD-Q3_K_XL (13.81GB)** | 26/28/30 | ctx=36864 | OOM | |
+| UD-Q3_K_XL | 32 | ctx=36864 (bench) | 45.90 | pp512 450.4 |
+| UD-Q3_K_XL | 32 | 프로덕션(ctx=36864) | **43.2** | **최종 채택** |
+
+**컨텍스트 상한 ↔ ncmoe 교환비** (UD-Q3_K_XL, KV q8_0)
+
+| 목표 컨텍스트 | 들어가는 최소 ncmoe | tg128 |
+|---:|---:|---:|
+| 36864 | 32 | 45.3 |
+| 49152 | 34 | 43.6 |
+| 65536 | 38 | 41.3 |
+| 73728 | 40 | 40.3 |
+| 81920 | — | 불가(ncmoe 40까지 OOM) |
+
+**KV 캐시 양자화 비교** (UD-Q3_K_XL, ncmoe=32 고정) — *채택하지 않음*
+
+| K / V | 최대 컨텍스트 | tg128(동일 조건) | 판정 |
+|---|---:|---:|---|
+| **q8_0 / q8_0** | 36864 | **44.8** | **채택** |
+| q8_0 / q4_0 | 49152 | 38.8 | 컨텍스트는 +33%지만 **13.5% 느림** |
+| q4_0 / q4_0 | 65536 | — | 컨텍스트는 +78%지만 동일한 이유로 기각 |
+
+> V캐시를 4비트로 낮추면 같은 `ncmoe`에서 컨텍스트를 크게 늘릴 수 있어 매력적으로 보이지만, Turing(sm_75)에는 q4_0 V캐시용 최적화 flash-attention 커널이 없어 역양자화 비용을 그대로 물어 오히려 느려집니다. 프로덕션 실측으로도 43.2 → 34.0 tok/s로 떨어졌습니다. 최신 아키텍처 GPU에서는 결과가 다를 수 있습니다.
+
+**프롬프트 접두부 캐시** (22205토큰 시스템 프롬프트, 순차 3턴)
+
+| 턴 | 신규 처리 토큰 | 소요 | 캐시 재사용 |
+|---|---:|---:|---:|
+| 1 | 22205 | 38539 ms | 0 |
+| 2 | 14 | 177 ms | 22206 |
+| 3 | 15 | 181 ms | 22221 |
+
+**스레드 스케일링** (IQ4_XS, ncmoe=34, 소형 ctx 기준 — 대역폭 포화 검증용)
+
+| 스레드 | 2 | 3 | 4 | 5 | 6 |
+|---|---:|---:|---:|---:|---:|
+| tg128 | 25.00 | 32.39 | 36.73 | 38.10 | 38.66 |
+
+**추측 디코딩** (MoE에는 역효과, 참고용)
+
+| 조합 | tg | 수락률 |
+|---|---:|---:|
+| 30B-A3B Q4_K_M + Qwen3-0.6B draft(CPU) | 17.28 | 48.8% |
+
+**RAM 대역폭 실측** (자체 컴파일 벤치마크, `gcc -O3 -march=native -fopenmp`)
+
+| 측정 | 값 |
+|---|---:|
+| 순차 읽기 대역폭 | 29.1 GB/s |
+| DDR5-5600 싱글채널 이론치 대비 | 65% |
+
+### 전체 요약 (모델 간 최고 실측치)
+
+| 모델 | 최고 tg128 | 프로덕션 실측 |
+|---|---:|---:|
+| Qwen2.5-Coder-32B (덴스+추측디코딩) | 6.06 | 6.06 |
+| Qwen2.5-Coder-14B (덴스) | 18.27 | 15.1 |
+| Qwen2.5-Coder-30B-A3B Q4_K_M (MoE) | 38.37 | 37.5 |
+| Qwen2.5-Coder-30B-A3B IQ4_XS (MoE) | 40.98(소형ctx만) | 37.8 |
+| **Qwen2.5-Coder-30B-A3B UD-Q3_K_XL (MoE)** | **45.90** | **43.2** |
+| Qwen2.5-Coder-7B (덴스, 전체 GPU) | 64.44 | 58.4 |
+
+> 7B가 raw 속도는 가장 빠르지만 버그 발생률 때문에 채택하지 않았습니다. 자세한 내용은 위 "모델 비교 벤치마크"와 "왜 MoE인가" 참고.
+
+## 알아둘 점 / 한계
+
+- 이 구성은 8GB VRAM 제약 아래 낸 절충안입니다. VRAM이 더 크면(예: MI50 32GB) `--n-cpu-moe`를 낮추거나 아예 0으로 두어 전체를 GPU에 올려 훨씬 더 빠르게 돌릴 수 있습니다.
+- 생성된 코드는 사람의 검토가 필요합니다. 7B/14B 모델에서 실제 버그(잘못된 import, 존재하지 않는 파라미터명 등)를 여러 건 확인했습니다. 30B-A3B가 가장 안정적이었지만 무조건적인 신뢰는 금물입니다.
+- `llama-cli`/`llama-bench`와 `llama-server`는 기본 컨텍스트/배치 크기가 달라 동일 `-ncmoe` 값에서도 VRAM 요구량이 다를 수 있습니다. 실제 값을 바꿀 때는 여유분을 두고 테스트하는 것을 권장합니다.
+#!/bin/bash
+exec ~/llama.cpp/build-cuda/bin/llama-server \
+  -m ~/models/Qwen3-Coder-30B-A3B-Instruct-UD-Q3_K_XL.gguf \
+  -ngl 99 -ncmoe 38 -fa on -t 6 -lm none -np 2 -kvu \
+  -c 65536 -ctk q8_0 -ctv q8_0 \
+  --temp 0.7 --top-p 0.8 --top-k 20 --repeat-penalty 1.05 --min-p 0.0 \
+  --host 127.0.0.1 --port 8080
+# llama-server Development Documentation
+
+This document provides an in-depth technical overview of `llama-server`, intended for maintainers and contributors.
+
+If you are an end user consuming `llama-server` as a product, please refer to the main [README](./README.md) instead.
+
+## Scope of features
+
+In-scope types of feature:
+
+- Backend:
+    - Basic inference features: text completion, embeddings output
+    - Chat-oriented features: chat completion, tool calling
+    - Third-party API compatibility, e.g. OAI-compat, Anthropic-compat
+    - Multimodal input/output
+    - Memory management: save/load state, context checkpoints
+    - Model management
+    - Features that are required by the Web UI
+- Frontend:
+    - Chat-oriented features, example: basic chat, image upload, edit messages
+    - Agentic features, example: MCP
+    - Model management
+
+Note: For security reasons, features that require reading or writing external files must be **disabled by default**. This covers features like: MCP, model save/load
+
+Out-of-scope features:
+
+- Backend:
+    - Features that require a loop of external API calls, e.g. server-side agentic loop. This is because external API calls in C++ are costly to maintain. Any complex third-party logic should be implemented outside of server code.
+    - Features that expose the internal state of the model to the API, example: getting the intermediate activation from API. This is because llama.cpp doesn't support a stable API for doing this, and relying on `eval_callback` can make it complicated to maintain as this API is not intended to be used in multi-sequence setup.
+    - Model-specific features. All API calls and features must remain model-agnostic.
+- Frontend:
+    - Third-party plugins, it is costly to maintain a public plugin API for such features. Instead, users can make their own MCP server for their needs.
+    - Customizable themes, it is also costly to maintain. While we do focus on the aesthetic, we try to achieve this by perfecting a small set of themes.
+    - Browser-specific features, example: [Chrome's built-in AI API](https://developer.chrome.com/docs/ai/built-in-apis).
+
+## Backend
+
+### Overview
+
+The server supports two primary operating modes:
+
+- **Inference mode**: The default mode for performing inference with a single loaded GGUF model.
+- **Router mode**: Enables management of multiple inference server instances behind a single API endpoint. Requests are automatically routed to the appropriate backend instance based on the requested model.
+
+The core architecture consists of the following components:
+
+- `server_context`: Holds the primary inference state, including the main `llama_context` and all active slots.
+- `server_slot`: An abstraction over a single “sequence” in llama.cpp, responsible for managing individual parallel inference requests.
+- `server_routes`: Middleware layer between `server_context` and the HTTP interface; handles JSON parsing/formatting and request routing logic.
+- `server_http_context`: Implements the HTTP server using `cpp-httplib`.
+- `server_queue`: Thread-safe queue used by HTTP workers to submit new tasks to `server_context`.
+- `server_response`: Thread-safe queue used by `server_context` to return results to HTTP workers.
+- `server_response_reader`: Higher-level wrapper around the two queues above for cleaner code.
+- `server_task`: Unit of work pushed into `server_queue`.
+- `server_task_result`: Unit of result pushed into `server_response`.
+- `server_tokens`: Unified representation of token sequences (supports both text and multimodal tokens); used by `server_task` and `server_slot`.
+- `server_prompt_checkpoint`: For recurrent (e.g., RWKV) and SWA models, stores snapshots of KV cache state. Enables reuse when subsequent requests share the same prompt prefix, saving redundant computation.
+- `server_models`: Standalone component for managing multiple backend instances (used in router mode). It is completely independent of `server_context`.
+- `stream_session_manager`: process wide owner of resumable SSE stream sessions, keyed by conversation id. A file-static singleton inside `server-stream.cpp`, driven through `server_stream_session_manager_start/stop`. Backs the replay buffer that lets a client reattach to a generation after an HTTP disconnect. See the "Resumable streaming" section below.
+
+```mermaid
+graph TD
+    API_User <--> server_http_context
+    server_http_context <-- router mode --> server_models
+    server_http_context <-- inference mode --> server_routes
+    server_routes -- server_task --> server_queue
+    subgraph server_context
+        server_queue --> server_slot
+        server_slot -- server_task_result --> server_response
+        server_slot[multiple server_slot]
+    end
+    server_response --> server_routes
+```
+
+### Batching
+
+The server context maintains a single batch shared across all slots. When `update_slots()` is invoked, the system iterates through all active slots to populate this batch. For each slot, either a generated token from the previous decoding step or available prompt tokens are added to the batch.
+
+Batching constraints apply: slots can only be batched together if they share compatible configurations. For instance, slots using a specific LoRA adapter can be batched with each other, but not with slots using a different LoRA adapter or no adapter at all.
+
+Once the batch reaches capacity or all slots have been processed, `llama_decode` is called to execute the inference. This operation represents the primary computational bottleneck in `update_slots()`.
+
+Following decoding, the system either retrieves embeddings or samples the next token using `common_sampler_sample`. If a slot has remaining prompt tokens to process, it yields until the next `update_slots()` iteration.
+
+### Thread Management
+
+`server_context` runs on a dedicated single thread. Because it is single-threaded, heavy post-processing (especially after token generation) should be avoided, as it directly impacts multi-sequence throughput.
+
+Each incoming HTTP request is handled by its own thread managed by the HTTP library. The following operations are performed in HTTP worker threads:
+
+- JSON request parsing
+- Chat template application
+- Tokenization
+- Conversion of `server_task_result` into final JSON response
+- Error formatting into JSON
+- Tracking of partial/incremental responses (e.g., streaming tool calls or reasoning steps)
+
+**Best practices to follow:**
+
+- All JSON formatting and chat template logic must stay in the HTTP layer.
+- Avoid passing raw JSON between the HTTP layer and `server_slot`. Instead, parse everything into native C++ types as early as possible.
+
+### Example trace of a request
+
+Here is an example trace of an API request for text completion:
+
+- A request arrives at the HTTP layer.
+- The request is routed to the corresponding handler inside `server_routes`. In this case, `handle_completions_impl` is invoked.
+- The handler parses the input request, constructs a new `server_task`, and passes it to `server_res_generator`.
+- `server_res_generator` creates a new `task_result_state` for each task:
+    - `task_result_state` stays in the HTTP layer, responsible for keeping track of the current state of the response (e.g., parsing tool calls or thinking messages).
+    - `server_task` is moved into `server_queue` inside `server_context`.
+- `server_context` launches the task by moving it into an available slot (see `launch_slot_with_task()`).
+- `update_slot()` processes the task as described in the "Batching" section above.
+- Results may be sent using `send_partial_response` or `send_final_response`, which creates a new `server_task_result` and pushes it to the response queue.
+- At the same time, `server_res_generator` listens to the response queue and retrieves this response.
+- As the response is stateless, `server_res_generator` calls `response->update()` to update the response with the current state.
+- `server_res_generator` then calls `response->to_json()` and passes the response to the HTTP layer.
+
+### Resumable streaming (SSE replay buffer)
+
+By default a streaming generation is bound to its HTTP socket: when the socket drops (refresh, tab close, mobile background, transient network) the generation aborts and the live stream is lost. This feature keeps the generation running server side and lets a client reattach.
+
+It is opt in via the `X-Conversation-Id` header on `POST /v1/chat/completions`. Without the header the OAI strict path is unchanged. The conversation id is the only identity end to end (server map key, client localStorage key, route path), with an optional `::model` suffix for direct routing in router mode.
+
+The feature lives entirely in `server-stream.{h,cpp}` and rests on three types:
+
+- `stream_session`: a bounded ring buffer (4 MiB cap, oldest bytes drop first) plus a condvar. `append` pushes raw SSE bytes, `read_from` drains from any offset and blocks for live bytes or finalize, `finalize` wakes readers, `cancel` sets the flag the producer polls. One conv maps to at most one live session.
+- `stream_session_manager`: a file-static singleton (`g_stream_sessions`) inside `server-stream.cpp`, owns all sessions keyed by conv id, enforces the one conv one session invariant via `create_or_replace`, and runs a GC thread that drops completed sessions past their TTL. Exposed to main only through `server_stream_session_manager_start/stop`.
+- `stream_pipe_producer` / `stream_pipe_consumer`: the write and read ends. The producer owns the session lifetime and finalizes it on destruction; the consumer is read only and never finalizes, so a reader detaching cannot kill a running generation.
+
+The implementation is hidden in `server-stream.cpp` (pimpl). The header exposes only the route handler factories, the `server_res_spipe` response base, `server_stream_conv_id_from_headers` and the GC lifecycle; the session, manager, consumer and the `server_stream_create_spipe` factory stay in the `.cpp`.
+
+Producer side: `server_res_generator` extends `server_res_spipe`, which keeps all spipe logic out of the generic `server_http_res`. `set_req` attaches a producer when the header is present, and the wrapped `next` tees each chunk into the ring before the socket, so a chunk lost to a dead wire is already buffered. While attached, `should_stop` ignores peer disconnect: only a `DELETE` stops generation. On an early peer drop, `on_complete` drains the tail into the ring on the http worker.
+
+Lifetime safety: the session holds no back reference to the response, so `spipe` is a plain `unique_ptr` touched only by the http worker. `cancel` raises an atomic the producer polls; the producer finalizes the session from its destructor, which also runs `~server_response_reader::stop()` to cancel the generation at the queue level. A `DELETE` stops work by raising the flag and letting the worker unwind.
+
+Consumer side: `GET /v1/stream?conv_id=<id>&from=N` opens a `text/event-stream` that replays buffered bytes from offset `N` and blocks for live bytes, so the browser reattaches like a fresh EventSource. An offset below the dropped prefix returns 400.
+
+Routes:
+
+- `GET /v1/stream?conv_id=<id>&from=N`: replay or live reattach. The id travels in the query string because it can embed a model name containing slashes.
+- `POST /v1/streams/lookup` with `{"conversation_ids": [...]}`: returns session status only for ids the caller already owns. There is no listing route, so live sessions cannot be enumerated (an earlier `GET /v1/streams` was removed for exactly this reason).
+- `DELETE /v1/stream?conv_id=<id>`: explicit Stop, idempotent (`evict_and_cancel`).
+
+Router mode binds the same paths to proxy handlers. A `conv_id -> child` map (`conv_models`), populated when a POST is routed, resolves the owning child in one lookup with no polling. The lookup groups ids per child; GET and DELETE proxy straight to the owner. This loopback REST hop is expected to move to a websocket IPC later, swapping only the transport.
+
+Lifecycle: `server_stream_session_manager_start()` runs in main after common init, `server_stream_session_manager_stop()` runs first in `clean_up()` and finalizes every live session so no reader hangs. Reader blocking and the post drop drain both run on httplib worker threads, which block on a condvar rather than spin.
+
+| Constant | Value | Role |
+| --- | --- | --- |
+| `STREAM_SESSION_TTL_SECONDS` | 300 | retention of a completed session before GC |
+| `STREAM_SESSION_MAX_BYTES` | 4 MiB | ring cap per session |
+| `STREAM_SESSION_GC_INTERVAL_SECONDS` | 60 | GC tick |
+| `STREAM_READ_WAKE_INTERVAL_MS` | 200 | read_from wake to recheck should_stop |
+| `STREAM_LOOKUP_TIMEOUT_MS` | 250 | router to child loopback budget |
+
+```mermaid
+graph TD
+    Client -- "POST + X-Conversation-Id" --> RG[server_res_generator]
+    RG -- attach --> Prod[stream_pipe_producer]
+    Prod -- "write, drain on peer drop" --> Sess
+    subgraph g_stream_sessions
+        Sess[stream_session: ring buffer, 4 MiB]
+        GC[GC thread] -- drop after TTL --> Sess
+    end
+    Sess -- read_from offset --> Cons[stream_pipe_consumer]
+    Cons -- "GET /v1/stream?conv_id=id&from=N" --> Client
+    DEL[DELETE /v1/stream?conv_id=id] -- evict_and_cancel --> Sess
+```
+
+The diagram shows the buffer touch points. The live wire (chunks streamed to the original client during a normal generation) is the producer's default output, described under "Producer side" above.
+
+### Testing
+
+`llama-server` includes an automated test suite based on `pytest`.
+
+The framework automatically starts a `llama-server` instance, sends requests, and validates responses.
+
+For detailed instructions, see the [test documentation](./tests/README.md).
+
+### API for tools
+
+This endpoint is intended to be used internally by the Web UI and subject to change or to be removed in the future.
+
+**GET /tools**
+
+Get a list of tools, each tool has these fields:
+- `tool` (string): the ID name of the tool, to be used in POST call. Example: `read_file`
+- `display_name` (string): the name to be displayed on UI. Example: `Read file`
+- `type` (string): `"server"` for a server tool, or `"mcp"` for a tool exposed by an MCP server
+- `permissions` (object): a mapping string --> boolean that indicates the permission required by this tool. This is useful for the UI to ask the user before calling the tool. For now, the only permission supported is `"write"`
+- `definition` (object): the OAI-compat definition of this tool
+
+**POST /tools**
+
+Invoke a tool call, request body is a JSON object with:
+- `tool` (string): the name of the tool
+- `params` (object): a mapping from argument name (string) to argument value
+
+Headers:
+- `x-tool-cwd`: optional; if set, use as the CWD for tool; this is not part of tool's params because it's meant to be set by the runtime, not the LLM itself
+- `x-tool-runtime`: optional; if set, run the tool inside this isolate instead of on the host. Either `docker-container:<id>` or `podman-container:<id>`, using an already-running container, or `ssh:<target>`, running the tool on a remote host
+
+Returns JSON object. There are two response formats (MCP tools use the same two formats: their result content is concatenated into `plain_text_response`, and RPC or tool errors are surfaced as the `error` string):
+
+Format 1: Plain text. The text will be placed into a field called `plain_text_response`, example:
+
+```json
+{
+    "plain_text_response": "this is a text response"
+}
+```
+
+The client should extract this value and place it inside message content (note: content is no longer a JSON), example
+
+```json
+{
+    "role": "tool",
+    "content": "this is a text response"
+}
+```
+
+Format 2: Normal JSON response, example:
+
+```json
+{
+    "error": "cannot open this file"
+}
+```
+
+That requires `JSON.stringify` when formatted to message content:
+
+```json
+{
+    "role": "tool",
+    "content": "{\"error\":\"cannot open this file\"}"
+}
+```
+
+Set `stream: true` in the request body to stream a tool's output as it runs, instead of waiting for it to finish. Only certain tools accept this (for ex. `exec_shell_command`);
+returns 404 if tool doesn't support it.
+
+Response is SSE stream, one `data: <json>` line per chunk:
+
+```json
+{"chunk": "hello\n"}
+```
+
+followed by a final event once the tool returns:
+
+```json
+{"done": true}
+```
+
+or, if `invoke()` threw:
+
+```json
+{"done": true, "error": "..."}
+```
+
+There is no `[DONE]` sentinel (unlike `/chat/completions`), the stream ends after the `done`
+
+### Router mode: how child <--> router communicates
+
+Upon spawning a new child process using `subprocess`, both child and router listen to the stdout/stderr (combined)
+
+For the direction from child to router:
+- Generic messages are logs, it will be forwarded to router's stdout
+- Special state update messages are prefixed by `cmd_child_to_router:state:`, followed by a JSON. See `server_models::handle_child_state` for more
+
+For the direction from router to child:
+- When server sends `cmd_router_to_child:exit`, the child should exit gracefully --> if after `DEFAULT_STOP_TIMEOUT` and the child is still running, force-kill it
+
+### Model management API (router mode)
+
+Model management API was added via PR [#23976](https://github.com/ggml-org/llama.cpp/pull/23976)
+
+The main goal of this API is to allow downloading models and/or removing models from the web UI. It relies on the model cache infrastructure under the hood to manage the list of models dynamically.
+
+Instead of building everything from the ground up (like what most AI agents will do when you ask them to implement a similar feature), we built on top of existing, already well-engineered components inside the codebase:
+- Model cache infrastructure as mentioned above (`common/download.h`)
+- Server response queue (`server-queue.h`). We use this feature to broadcast events to SSE clients.
+- Server router thread management (`server-models.h`). We re-use the same thread model that is used for managing subprocess life cycle, except that we don't create a new subprocess, but launch the download right inside the thread.
+
+The flow for downloading a new model:
+- POST request comes in --> `post_router_models` --> validation
+- A new `llama-server` subprocess will be spawned with special `SERVER_CHILD_MODE_DOWNLOAD`
+- Child process runs the download and report status back to router via stdin/out
+- If a stop request comes in, the router asks the child process to stop (same mechanism as running a model in child process)
+- Otherwise, upon completion, we call `load_models()` to refresh the list of models
+
+### Sleep mode
+
+Sleep mode was initially introduced in PR [#18228](https://github.com/ggml-org/llama.cpp/pull/18228). The main idea is to have:
+- `server_queue` keeping track of the idle timeout
+- When the timeout is detected, `server_queue` signals to `server_context_impl` that it should go into sleep
+- `server_context_impl` frees all `llama_context` and `mtmd_context`
+
+Compared to simply exiting the whole process, this approach allows accessing some read-only endpoints during sleep, while also handling wakeup-on-request. Any inference request will wake the server up.
+
+Call stack on entering sleeping:
+- `server_queue::start_loop` (main thread) sees no task for `idle_sleep_ms` --> `sleeping = true`
+- `cb0(true)` --> `server_routes::update_cached_responses`
+    - snapshots `/props`, `/models` and metrics; the model is still alive here
+- `cb1(true)` --> `server_context_impl::handle_sleeping_state`
+    - `callback_state(SERVER_STATE_SLEEPING)` --> reported to router in child mode
+    - `destroy()` --> frees `llama_context` and `mtmd_context`
+- `condition_tasks.wait` until `req_stop_sleeping`
+
+Call stack on waking up:
+- `server_res_generator` constructor (HTTP thread) --> `server_queue::wait_until_no_sleep`
+    - sets `req_stop_sleeping = true`, then waits until `sleeping == false`
+- `server_queue::start_loop` (main thread) wakes up
+- `cb1(false)` --> `server_context_impl::handle_sleeping_state`
+    - `load_model()`, which then emits `callback_state(SERVER_STATE_READY)`
+- `cb0(false)` --> `server_routes::update_cached_responses`
+    - nothing to do, the cache is only read during sleep
+- `sleeping = false` --> `notify_all` unblocks the HTTP thread, the request is handled as usual
+
+Endpoints created with `create_response(true)` (`/health`, `/props`, `/models`, `/metrics`) skip `wait_until_no_sleep`, so they answer from the cached responses instead of waking the server.
+
+### Notable Related PRs
+
+- Initial server implementation: https://github.com/ggml-org/llama.cpp/pull/1443
+- Parallel decoding support: https://github.com/ggml-org/llama.cpp/pull/3228
+- Refactor introducing `server_queue` and `server_response`: https://github.com/ggml-org/llama.cpp/pull/5065
+- Reranking endpoint: https://github.com/ggml-org/llama.cpp/pull/9510
+- Multimodal model support (`libmtmd`): https://github.com/ggml-org/llama.cpp/pull/12898
+- Unified KV cache handling: https://github.com/ggml-org/llama.cpp/pull/16736
+- Separation of HTTP logic into dedicated files: https://github.com/ggml-org/llama.cpp/pull/17216
+- Large-scale code base split into smaller files: https://github.com/ggml-org/llama.cpp/pull/17362
+- Introduction of router mode: https://github.com/ggml-org/llama.cpp/pull/17470
+- Speculative decoding: https://github.com/ggml-org/llama.cpp/pull/17808 and rework in https://github.com/ggml-org/llama.cpp/pull/17808
+- INI presets: https://github.com/ggml-org/llama.cpp/pull/17859 (+ refactoring: https://github.com/ggml-org/llama.cpp/pull/18169)
+- Sleeping mode: https://github.com/ggml-org/llama.cpp/pull/18228
+- Resumable streaming (SSE replay buffer): https://github.com/ggml-org/llama.cpp/pull/23226
+
+
+
+
+## Web UI
+
+The project includes a web-based user interface for interacting with `llama-server`. It supports both single-model (`MODEL` mode) and multi-model (`ROUTER` mode) operation.
+
+The SvelteKit-based Web UI is introduced in this PR: https://github.com/ggml-org/llama.cpp/pull/14839
+
+### Features
+
+-   **Chat interface** with streaming responses
+-   **Multi-model support** (ROUTER mode) - switch between models, auto-load on selection
+-   **Modality validation** - ensures selected model supports conversation's attachments (images, audio)
+-   **Conversation management** - branching, regeneration, editing with history preservation
+-   **Attachment support** - images, audio, PDFs (with vision/text fallback)
+-   **Configurable parameters** - temperature, top_p, etc. synced with server defaults
+-   **Dark/light theme**
+
+### Tech Stack
+
+-   **SvelteKit** - frontend framework with Svelte 5 runes for reactive state
+-   **TailwindCSS** + **shadcn-svelte** - styling and UI components
+-   **Vite** - build tooling
+-   **IndexedDB** (Dexie) - local storage for conversations
+-   **LocalStorage** - user settings persistence
+
+### Architecture
+
+The UI follows a layered architecture:
+
+```
+Routes → Components → Hooks → Stores → Services → Storage/API
+```
+
+-   **Stores** - reactive state management (`chatStore`, `conversationsStore`, `modelsStore`, `serverStore`, `settingsStore`)
+-   **Services** - stateless API/database communication (`ChatService`, `ModelsService`, `PropsService`, `DatabaseService`)
+-   **Hooks** - reusable logic (`useModelChangeValidation`, `useProcessingState`)
+
+For detailed architecture diagrams, see [`tools/ui/docs/`](../ui/docs/):
+
+-   `high-level-architecture.mmd` - full architecture with all modules
+-   `high-level-architecture-simplified.mmd` - simplified overview
+-   `data-flow-simplified-model-mode.mmd` - data flow for single-model mode
+-   `data-flow-simplified-router-mode.mmd` - data flow for multi-model mode
+-   `flows/*.mmd` - detailed per-domain flows (chat, conversations, models, etc.)
+
+### Development
+
+```sh
+# make sure you have Node.js installed
+cd tools/ui
+npm i
+
+# run dev server (with hot reload)
+npm run dev
+
+# run tests
+npm run test
+
+# build production bundle
+npm run build
+```
+
+After `public/index.html` has been generated, rebuild `llama-server` as described in the [build](#build) section to include the updated UI.
+
+**Note:** The Vite dev server automatically proxies API requests to `http://localhost:8080`. Make sure `llama-server` is running on that port during development.
+# LLaMA.cpp HTTP Server
+
+Fast, lightweight, pure C/C++ HTTP server based on [httplib](https://github.com/yhirose/cpp-httplib), [nlohmann::json](https://github.com/nlohmann/json) and **llama.cpp**.
+
+Set of LLM REST APIs and a web UI to interact with llama.cpp.
+
+**Features:**
+ * LLM inference of F16 and quantized models on GPU and CPU
+ * [OpenAI API](https://github.com/openai/openai-openapi) compatible chat completions, responses, and embeddings routes
+ * [Anthropic Messages API](https://docs.anthropic.com/en/api/messages) compatible chat completions
+ * Reranking endpoint (https://github.com/ggml-org/llama.cpp/pull/9510)
+ * Parallel decoding with multi-user support
+ * Continuous batching
+ * Multimodal ([documentation](../../docs/multimodal.md)) / with OpenAI-compatible API support
+ * Monitoring endpoints
+ * Schema-constrained JSON response format
+ * Prefilling of assistant messages similar to the Claude API
+ * [Function calling](../../docs/function-calling.md) / tool use for ~any model
+ * Speculative decoding
+ * Easy-to-use web UI
+
+For the full list of features, please refer to [server's changelog](https://github.com/ggml-org/llama.cpp/issues/9291)
+
+## Usage
+
+<!-- HELP_START -->
+
+<!-- IMPORTANT: The list below is auto-generated by llama-gen-docs; do NOT modify it manually -->
+
+### Common params
+
+| Argument | Explanation |
+| -------- | ----------- |
+| `-h, --help, --usage` | print usage and exit |
+| `--version` | show version and build info |
+| `-cl, --cache-list` | show list of models in cache |
+| `--completion-bash` | print source-able bash completion script for llama.cpp |
+| `-t, --threads N` | number of CPU threads to use during generation (default: -1)<br/>(env: LLAMA_ARG_THREADS) |
+| `-tb, --threads-batch N` | number of threads to use during batch and prompt processing (default: same as --threads) |
+| `-C, --cpu-mask M` | CPU affinity mask: arbitrarily long hex. Complements cpu-range (default: "") |
+| `-Cr, --cpu-range lo-hi` | range of CPUs for affinity. Complements --cpu-mask |
+| `--cpu-strict <0\|1>` | use strict CPU placement (default: 0) |
+| `--prio N` | set process/thread priority : low(-1), normal(0), medium(1), high(2), realtime(3) (default: 0) |
+| `--poll <0...100>` | use polling level to wait for work (0 - no polling, default: 50) |
+| `-Cb, --cpu-mask-batch M` | CPU affinity mask: arbitrarily long hex. Complements cpu-range-batch (default: same as --cpu-mask) |
+| `-Crb, --cpu-range-batch lo-hi` | ranges of CPUs for affinity. Complements --cpu-mask-batch |
+| `--cpu-strict-batch <0\|1>` | use strict CPU placement (default: same as --cpu-strict) |
+| `--prio-batch N` | set process/thread priority : 0-normal, 1-medium, 2-high, 3-realtime (default: 0) |
+| `--poll-batch <0\|1>` | use polling to wait for work (default: same as --poll) |
+| `-c, --ctx-size N` | size of the prompt context (default: 0, 0 = loaded from model)<br/>(env: LLAMA_ARG_CTX_SIZE) |
+| `-n, --predict, --n-predict N` | number of tokens to predict (default: -1, -1 = infinity)<br/>(env: LLAMA_ARG_N_PREDICT) |
+| `-b, --batch-size N` | logical maximum batch size (default: 2048)<br/>(env: LLAMA_ARG_BATCH) |
+| `-ub, --ubatch-size N` | physical maximum batch size (default: 512)<br/>(env: LLAMA_ARG_UBATCH) |
+| `--keep N` | number of tokens to keep from the initial prompt (default: 0, -1 = all) |
+| `--swa-full` | use full-size SWA cache (default: false)<br/>[(more info)](https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)<br/>(env: LLAMA_ARG_SWA_FULL) |
+| `-fa, --flash-attn [on\|off\|auto]` | set Flash Attention use ('on', 'off', or 'auto', default: 'auto')<br/>(env: LLAMA_ARG_FLASH_ATTN) |
+| `--perf, --no-perf` | whether to enable internal libllama performance timings (default: false)<br/>(env: LLAMA_ARG_PERF) |
+| `-e, --escape, --no-escape` | whether to process escapes sequences (\n, \r, \t, \', \", \\) (default: true) |
+| `--rope-scaling {none,linear,yarn}` | RoPE frequency scaling method, defaults to linear unless specified by the model<br/>(env: LLAMA_ARG_ROPE_SCALING_TYPE) |
+| `--rope-scale N` | RoPE context scaling factor, expands context by a factor of N<br/>(env: LLAMA_ARG_ROPE_SCALE) |
+| `--rope-freq-base N` | RoPE base frequency, used by NTK-aware scaling (default: loaded from model)<br/>(env: LLAMA_ARG_ROPE_FREQ_BASE) |
+| `--rope-freq-scale N` | RoPE frequency scaling factor, expands context by a factor of 1/N<br/>(env: LLAMA_ARG_ROPE_FREQ_SCALE) |
+| `--yarn-orig-ctx N` | YaRN: original context size of model (default: 0 = model training context size)<br/>(env: LLAMA_ARG_YARN_ORIG_CTX) |
+| `--yarn-ext-factor N` | YaRN: extrapolation mix factor (default: -1.00, 0.0 = full interpolation)<br/>(env: LLAMA_ARG_YARN_EXT_FACTOR) |
+| `--yarn-attn-factor N` | YaRN: scale sqrt(t) or attention magnitude (default: -1.00)<br/>(env: LLAMA_ARG_YARN_ATTN_FACTOR) |
+| `--yarn-beta-slow N` | YaRN: high correction dim or alpha (default: -1.00)<br/>(env: LLAMA_ARG_YARN_BETA_SLOW) |
+| `--yarn-beta-fast N` | YaRN: low correction dim or beta (default: -1.00)<br/>(env: LLAMA_ARG_YARN_BETA_FAST) |
+| `-kvo, --kv-offload, -nkvo, --no-kv-offload` | whether to enable KV cache offloading (default: enabled)<br/>(env: LLAMA_ARG_KV_OFFLOAD) |
+| `--repack, -nr, --no-repack` | whether to enable weight repacking (default: enabled)<br/>(env: LLAMA_ARG_REPACK) |
+| `--no-host` | bypass host buffer allowing extra buffers to be used<br/>(env: LLAMA_ARG_NO_HOST) |
+| `-ctk, --cache-type-k TYPE` | KV cache data type for K<br/>allowed values: f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1<br/>(default: f16)<br/>(env: LLAMA_ARG_CACHE_TYPE_K) |
+| `-ctv, --cache-type-v TYPE` | KV cache data type for V<br/>allowed values: f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1<br/>(default: f16)<br/>(env: LLAMA_ARG_CACHE_TYPE_V) |
+| `-dt, --defrag-thold N` | KV cache defragmentation threshold (DEPRECATED)<br/>(env: LLAMA_ARG_DEFRAG_THOLD) |
+| `--rpc SERVERS` | comma-separated list of RPC servers (host:port)<br/>(env: LLAMA_ARG_RPC) |
+| `--mlock` | DEPRECATED in favor of `--load-mode`: force system to keep model in RAM rather than swapping or compressing<br/>(env: LLAMA_ARG_MLOCK) |
+| `--mmap, --no-mmap` | DEPRECATED in favor of `--load-mode`: whether to memory-map model. (if mmap disabled, slower load but may reduce pageouts if not using mlock)<br/>(env: LLAMA_ARG_MMAP) |
+| `-dio, --direct-io, -ndio, --no-direct-io` | DEPRECATED in favor of `--load-mode`: use DirectIO if available<br/>(env: LLAMA_ARG_DIO) |
+| `-lm, --load-mode MODE` | model loading mode (default: auto)<br/>- auto: mmap, unless a device does not support it<br/>- none: no special loading mode<br/>- mmap: memory-map model (if mmap disabled, slower load but may reduce pageouts if not using mlock)<br/>- mlock: force system to keep model in RAM rather than swapping or compressing<br/>- mmap+mlock: mmap + force system to keep model in RAM rather than swapping or compressing<br/>- dio: use DirectIO if available<br/><br/>(env: LLAMA_ARG_LOAD_MODE) |
+| `--numa TYPE` | attempt optimizations that help on some NUMA systems<br/>- distribute: spread execution evenly over all nodes<br/>- isolate: only spawn threads on CPUs on the node that execution started on<br/>- numactl: use the CPU map provided by numactl<br/>if run without this previously, it is recommended to drop the system page cache before using this<br/>see https://github.com/ggml-org/llama.cpp/issues/1437<br/>(env: LLAMA_ARG_NUMA) |
+| `-dev, --device <dev1,dev2,..>` | comma-separated list of devices to use for offloading (none = don't offload)<br/>use --list-devices to see a list of available devices<br/>(env: LLAMA_ARG_DEVICE) |
+| `--list-devices` | print list of available devices and exit |
+| `-ot, --override-tensor <tensor name pattern>=<buffer type>,...` | override tensor buffer type<br/>(env: LLAMA_ARG_OVERRIDE_TENSOR) |
+| `-cmoe, --cpu-moe` | keep all Mixture of Experts (MoE) weights in the CPU<br/>(env: LLAMA_ARG_CPU_MOE) |
+| `-ncmoe, --n-cpu-moe N` | keep the Mixture of Experts (MoE) weights of the first N layers in the CPU<br/>(env: LLAMA_ARG_N_CPU_MOE) |
+| `-ngl, --gpu-layers, --n-gpu-layers N` | max. number of layers to store in VRAM, either an exact number, 'auto', or 'all' (default: auto)<br/>(env: LLAMA_ARG_N_GPU_LAYERS) |
+| `-sm, --split-mode {none,layer,row,tensor}` | how to split the model across multiple GPUs, one of:<br/>- none: use one GPU only<br/>- layer (default): split layers and KV across GPUs (pipelined)<br/>- row: split weight across GPUs by rows (parallelized)<br/>- tensor: split weights and KV across GPUs (parallelized, EXPERIMENTAL)<br/>(env: LLAMA_ARG_SPLIT_MODE) |
+| `-ts, --tensor-split N0,N1,N2,...` | fraction of the model to offload to each GPU, comma-separated list of proportions, e.g. 3,1<br/>(env: LLAMA_ARG_TENSOR_SPLIT) |
+| `-mg, --main-gpu INDEX` | the GPU to use for the model (with split-mode = none), or for intermediate results and KV (with split-mode = row) (default: 0)<br/>(env: LLAMA_ARG_MAIN_GPU) |
+| `-fit, --fit [on\|off]` | whether to adjust unset arguments to fit in device memory ('on' or 'off', default: 'on')<br/>(env: LLAMA_ARG_FIT) |
+| `-fitt, --fit-target MiB0,MiB1,MiB2,...` | target margin per device for --fit, comma-separated list of values, single value is broadcast across all devices, default: 1024<br/>(env: LLAMA_ARG_FIT_TARGET) |
+| `-fitc, --fit-ctx N` | minimum ctx size that can be set by --fit option, default: 4096<br/>(env: LLAMA_ARG_FIT_CTX) |
+| `--check-tensors` | check model tensor data for invalid values (default: false) |
+| `--override-kv KEY=TYPE:VALUE,...` | advanced option to override model metadata by key. to specify multiple overrides, either use comma-separated values.<br/>types: int, float, bool, str. example: --override-kv tokenizer.ggml.add_bos_token=bool:false,tokenizer.ggml.add_eos_token=bool:false |
+| `--op-offload, --no-op-offload` | whether to offload host tensor operations to device (default: true) |
+| `--lora FNAME` | path to LoRA adapter (use comma-separated values to load multiple adapters) |
+| `--lora-scaled FNAME:SCALE,...` | path to LoRA adapter with user defined scaling (format: FNAME:SCALE,...)<br/>note: use comma-separated values |
+| `--control-vector FNAME` | add a control vector<br/>note: use comma-separated values to add multiple control vectors |
+| `--control-vector-scaled FNAME:SCALE,...` | add a control vector with user defined scaling SCALE<br/>note: use comma-separated values (format: FNAME:SCALE,...) |
+| `--control-vector-layer-range START END` | layer range to apply the control vector(s) to, start and end inclusive |
+| `-m, --model FNAME` | model path to load<br/>(env: LLAMA_ARG_MODEL) |
+| `-mu, --model-url MODEL_URL` | model download url (default: unused)<br/>(env: LLAMA_ARG_MODEL_URL) |
+| `-dr, --docker-repo [<repo>/]<model>[:quant]` | Docker Hub model repository. repo is optional, default to ai/. quant is optional, default to :latest.<br/>example: gemma3<br/>(default: unused)<br/>(env: LLAMA_ARG_DOCKER_REPO) |
+| `-hf, -hfr, --hf-repo <user>/<model>[:quant]` | Hugging Face model repository; quant is optional, case-insensitive, default to Q4_K_M, or falls back to the first file in the repo if Q4_K_M doesn't exist.<br/>mmproj is also downloaded automatically if available. to disable, add --no-mmproj<br/>example: ggml-org/GLM-4.7-Flash-GGUF:Q4_K_M<br/>(default: unused)<br/>(env: LLAMA_ARG_HF_REPO) |
+| `-hff, --hf-file FILE` | Hugging Face model file. If specified, it will override the quant in --hf-repo (default: unused)<br/>(env: LLAMA_ARG_HF_FILE) |
+| `-hft, --hf-token TOKEN` | Hugging Face access token (default: value from HF_TOKEN environment variable)<br/>(env: HF_TOKEN) |
+| `--log-disable` | Log disable |
+| `--log-file FNAME` | Log to file<br/>(env: LLAMA_ARG_LOG_FILE) |
+| `--log-colors [on\|off\|auto]` | Set colored logging ('on', 'off', or 'auto', default: 'auto')<br/>'auto' enables colors when output is to a terminal<br/>(env: LLAMA_ARG_LOG_COLORS) |
+| `-v, --verbose, --log-verbose` | Set verbosity level to infinity (i.e. log all messages, useful for debugging) |
+| `--offline` | Offline mode: forces use of cache, prevents network access<br/>(env: LLAMA_ARG_OFFLINE) |
+| `-lv, --verbosity, --log-verbosity N` | Set the verbosity threshold. Messages with a higher verbosity will be ignored. Values:<br/> - 0: generic output<br/> - 1: error<br/> - 2: warning<br/> - 3: info<br/> - 4: trace (more info)<br/> - 5: debug<br/>(default: 3)<br/><br/>(env: LLAMA_ARG_LOG_VERBOSITY) |
+| `--log-prefix, --no-log-prefix` | Enable prefix in log messages<br/>(env: LLAMA_ARG_LOG_PREFIX) |
+| `--log-timestamps, --no-log-timestamps` | Enable timestamps in log messages<br/>(env: LLAMA_ARG_LOG_TIMESTAMPS) |
+| `--spec-draft-type-k, -ctkd, --cache-type-k-draft TYPE` | KV cache data type for K for the draft model<br/>allowed values: f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1<br/>(default: f16)<br/>(env: LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_K) |
+| `--spec-draft-type-v, -ctvd, --cache-type-v-draft TYPE` | KV cache data type for V for the draft model<br/>allowed values: f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1<br/>(default: f16)<br/>(env: LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_V) |
+
+
+### Sampling params
+
+| Argument | Explanation |
+| -------- | ----------- |
+| `--samplers SAMPLERS` | samplers that will be used for generation in the order, separated by ';'<br/>(default: penalties;dry;top_n_sigma;top_k;typ_p;top_p;min_p;xtc;temperature) |
+| `-s, --seed SEED` | RNG seed (default: -1, use random seed for -1) |
+| `--sampler-seq, --sampling-seq SEQUENCE` | simplified sequence for samplers that will be used (default: edskypmxt) |
+| `--ignore-eos` | ignore end of stream token and continue generating (implies --logit-bias EOS-inf) |
+| `--temp, --temperature N` | temperature (default: 0.80) |
+| `--top-k N` | top-k sampling (default: 40, 0 = disabled)<br/>(env: LLAMA_ARG_TOP_K) |
+| `--top-p N` | top-p sampling (default: 0.95, 1.0 = disabled) |
+| `--min-p N` | min-p sampling (default: 0.05, 0.0 = disabled) |
+| `--top-nsigma, --top-n-sigma N` | top-n-sigma sampling (default: -1.00, -1.0 = disabled) |
+| `--xtc-probability N` | xtc probability (default: 0.00, 0.0 = disabled) |
+| `--xtc-threshold N` | xtc threshold (default: 0.10, 1.0 = disabled) |
+| `--typical, --typical-p N` | locally typical sampling, parameter p (default: 1.00, 1.0 = disabled) |
+| `--repeat-last-n N` | last n tokens to consider for penalize (default: 64, 0 = disabled) |
+| `--repeat-penalty N` | penalize repeat sequence of tokens (default: 1.00, 1.0 = disabled) |
+| `--presence-penalty N` | repeat alpha presence penalty (default: 0.00, 0
