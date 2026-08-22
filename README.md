@@ -4,7 +4,7 @@
 
 Measured notes and the final configuration for running a 30B-class coding LLM at usable speed on a single 8GB GPU. Every number below was measured on the machine described here — including the approaches that turned out to be slower.
 
-**Result: 45.07 tok/s generation, 438.73 t/s prompt processing**, running a 30.5B-parameter model on a GPU that cannot hold it.
+**Result: a 30.5B-parameter model on a GPU that cannot hold it** — 45.07 tok/s generation and 438.73 t/s prompt processing at benchmark context; 21.1 tok/s generation and 722 t/s prompt processing in a real 22K-token Cline session.
 
 ## Hardware
 
@@ -37,20 +37,29 @@ llama.cpp's `--n-cpu-moe` then keeps only part of the expert FFN weights in syst
 ```bash
 llama-server \
   -m Qwen3-Coder-30B-A3B-Instruct-UD-Q3_K_XL.gguf \
-  -ngl 99 -ncmoe 32 -fa on -t 6 -lm none \
-  -c 36864 -ctk q8_0 -ctv q8_0 \
+  -ngl 99 -ncmoe 40 -fa on -t 6 -lm none -np 2 -kvu -ub 2048 \
+  -c 65536 -ctk q8_0 -ctv q8_0 \
   --temp 0.7 --top-p 0.8 --top-k 20 --repeat-penalty 1.05 --min-p 0.0 \
   --host 127.0.0.1 --port 8080
 ```
 
 | Flag | Why |
 |---|---|
-| `-ncmoe 32` | Keep 32 layers' expert weights on the CPU; everything else on the GPU |
+| `-ncmoe 40` | Keep 40 layers' expert weights on the CPU; everything else on the GPU |
+| `-ub 2048` | Physical batch size. **+77% prompt processing** (407 → 722 t/s) at no measurable cost to generation — the largest single win for an agent workload |
+| `-np 2 -kvu` | Two slots, unified KV. The default of four slots evicts its own 20K+ prompt caches; `-np` alone silently turns unified KV *off* and halves per-slot context |
+| `-c 65536` | Large enough that Cline rarely has to condense — each condense costs a 40–70 s prompt-cache rebuild |
 | `-lm none` | Load fully into RAM instead of mmap — removes page-fault overhead on offloaded tensors (prompt processing +34%) |
 | `-t 6` | Physical cores only. Using all 12 threads is **11% slower** (36.1 → 32.4 tok/s) |
 | `-fa on` | Flash Attention — free speed, no quality cost |
 | `-ctk/-ctv q8_0` | 8-bit KV cache. Do **not** drop V to `q4_0` on this GPU (see below) |
 | sampling flags | Qwen3-Coder's recommended values. llama-server defaults (temp 0.80 / top_p 0.95 / top_k 40) are too loose for agent coding and invite wrong APIs and imports |
+
+> An earlier revision of this document recommended `-c 36864 -ncmoe 32` for a Cline-only setup,
+> because it benchmarks 9% faster (45.3 vs 41.3 tok/s at `tg128`). Session logs showed that to be the
+> wrong trade for an agent client — see [Tuning for an agent workload](#tuning-for-an-agent-workload).
+> For short-context chat, where that 9% is real and nothing ever condenses, `-c 36864 -ncmoe 32`
+> remains the faster choice.
 
 Quantization went Q4_K_M (18.56GB) → IQ4_XS (16.38GB) → **UD-Q3_K_XL (13.81GB)**. Because generation is bandwidth-bound here, each shrink both frees VRAM (`ncmoe` 36 → 34 → 32) and cuts per-token RAM traffic, so speed rose at every step.
 
@@ -71,7 +80,64 @@ The practical consequence: this machine runs **single channel**, with one DIMM i
 | Speculative decoding with a small draft model | Effective on the 32B dense model, but **halved throughput to 17.3 tok/s** on the MoE — the draft model competes for the same CPU cores already saturated by expert offload |
 | `q4_0` V cache | Buys +33% context at the same `ncmoe`, but runs **13.5% slower** (44.8 → 38.8 tok/s). Turing (sm_75) has no optimized flash-attention path for `q4_0` V, so it pays full dequantization cost |
 | Per-tensor `-ot` offload | ~3% faster at small context, but OOMs at the production context — VRAM is already saturated |
-| Reducing `--parallel` | No VRAM freed; the server uses a unified KV cache across slots |
+| Reducing `--parallel` *to free VRAM* | No VRAM freed — the KV pool is sized by `-c`, not by slot count. Worth doing anyway, for an unrelated reason: see [Tuning for an agent workload](#tuning-for-an-agent-workload) |
+| `--cache-reuse 256` | **Exactly zero effect** — cache-hit counts were byte-identical with and without it in an A/B. Its reuse scan only advances the prompt-side pointer on a match, so the *inserted* summary that Cline's condense produces stops it before it can reach the unchanged recent messages. It absorbs *deletions* from the cache, not insertions (see the Korean section for the measurement) |
+
+## Tuning for an agent workload
+
+`tg128` is not what an agent session feels like. Aggregated from 36 minutes of real Cline traffic
+(server log, `-c 65536 -ncmoe 38 -ub 512`):
+
+| | Time | Tokens | Rate |
+|---|---:|---:|---:|
+| Prompt processing | 172.1 s | 56,032 | 326 t/s |
+| Generation | 192.9 s | 2,905 | **15.1 tok/s** |
+
+Two things follow. Generation at a 22K-token context runs 16–21 tok/s, not the 45 tok/s of `tg128` —
+context fill dominates and `ncmoe` barely moves it. And **prompt processing is 47% of wall time**,
+73% of which was two cold 22–25K prompts costing 56 s and 70 s. So the levers that matter are the ones
+that avoid reprocessing, plus the one that makes unavoidable reprocessing fast.
+
+### Batch size (`-ub`) — the largest single win
+
+Expert weights are read from RAM once per ubatch and amortized across every token in it, so a larger
+physical batch converts the bandwidth bottleneck into throughput. Measured on a fixed 21,970-token
+prompt with `cache_prompt: false`, median of 3 runs:
+
+| `-ub` / `-ncmoe` | Prompt processing | Generation @22K | VRAM |
+|---|---:|---:|---:|
+| 512 / 38 (previous) | 407 t/s | 21.02 tok/s | 7427 MiB |
+| 1024 / 38 | 573 t/s | 21.36 | 7551 |
+| 2048 / 38 | **OOM** — compute buffer | — | — |
+| **2048 / 40 (adopted)** | **722 t/s** | **21.11** | **7334** |
+| 2048 / 39 | 710 t/s | 20.92 | 7626 |
+| 4096 / 42 | 703 t/s | 20.21 | 6832 |
+
+`-ub 2048` does not fit at `ncmoe 38`, but the two expert layers it costs are free: at a 22K context
+they are 1.9% of per-token time, below the run-to-run spread. At short context the same two layers are
+resolvable and the 0.448 ms/layer model still holds — 38.4 tok/s measured at `ncmoe 40` against 38.9
+predicted. Moving them off the GPU also more than pays for the larger compute buffer: VRAM went *down*,
+7427 → 7334 MiB. `-ub 4096` is past the knee — no further gain, and generation starts to suffer.
+
+### Slot count (`-np`)
+
+With the default of 4 slots, 14 of 18 slot selections in the session log fell back to LRU: four separate
+18–25K conversations were resident at once, 87K of demand against a 65K unified KV pool, evicting each
+other. Cline runs one conversation plus small auxiliary calls, so two slots suffice — and with exactly
+two, LRU sends the auxiliary call to the *other* slot and leaves the main prefix intact. Slot count
+costs no VRAM either way.
+
+> **`-np N` silently disables unified KV.** Its default is "enabled only when the slot count is auto",
+> so `-np 2` alone turns `-c 65536` into 32768 per slot, which then breaks a client configured for a
+> 61440 context window. Always pass `-kvu` with it.
+
+### Context size (`-c`)
+
+A smaller `-c` permits a lower `ncmoe`, worth up to 9% at benchmark context. But every condense
+invalidates the prompt cache — structurally, not fixably (see `--cache-reuse` above). A 36864 context
+puts Cline's condense threshold at 29.5K, and observed sessions already reach 28.3K. One rebuild costs
+40–70 s; at ~20 tok/s, a 9% generation gain needs roughly 14,000 generated tokens to pay for a single
+one. The measured session generated 2,905 tokens in 36 minutes.
 
 ## Client setup (Cline)
 
@@ -81,7 +147,7 @@ Point any OpenAI-compatible client at `http://127.0.0.1:8080/v1`. For Cline, **`
 error: request (41403 tokens) exceeds the available context size (36864 tokens)
 ```
 
-Raising `-c` is the wrong fix: requests kept growing (25544 → 41403), and a larger context forces `ncmoe` up, costing 4–11% throughput. Cline condenses at 0.9 / 0.7 of `contextWindow` once told, so setting it leaves the fast server config untouched:
+Raising `-c` by itself does not fix this — Cline fills whatever it is given (requests grew 25544 → 41403). Cline condenses at 0.9 / 0.7 of `contextWindow` once told, so the client is where the limit belongs:
 
 ```json
 {
@@ -89,12 +155,48 @@ Raising `-c` is the wrong fix: requests kept growing (25544 → 41403), and a la
   "baseUrl": "http://127.0.0.1:8080/v1",
   "apiKey": "sk-no-key-required",
   "model": "Qwen3-Coder-30B-A3B-Instruct-UD-Q3_K_XL.gguf",
-  "contextWindow": 36864,
+  "contextWindow": 61440,
   "maxTokens": 4096
 }
 ```
 
+Keep `contextWindow` in sync with the server: `-c` minus `maxTokens`. Do not set it lower than it has to be — condensing is what destroys the prompt cache, so a needlessly small window costs far more than it saves.
+
 Note that Cline only sends sampling parameters when they are explicitly configured, so the server-side defaults above are what it actually gets.
+
+## Model landscape, August 2026
+
+This document's model choice dates from mid-2025. Two things have changed since, and neither is
+"a bigger MoE" — nothing in the next size class fits 32GB, let alone 8GB.
+
+**A newer model at the same active-parameter count.** [Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF)
+(April 2026) has the same ~3B active parameters as Qwen3-Coder-30B-A3B, so it lands in the same speed
+class, but scores **73.4% on SWE-bench Verified against 50.3–51.6%** for the incumbent. Its Gated
+DeltaNet / Gated Attention hybrid also runs full attention on only one layer in four, so its KV cache
+is far smaller — directly useful against the condense problem above. UD-Q3_K_XL is 16.8 GB against the
+current 13.81 GB, so `ncmoe` has to rise; whether that trade is worth it on 8GB is measured below.
+Use its non-thinking mode for agent work — thinking tokens are latency on every tool call.
+
+**Everything else in reach is a sidegrade or does not fit.**
+
+| Model | Total / active | SWE-bench Verified | Fits 8GB + 32GB RAM? |
+|---|---|---:|---|
+| Qwen3-Coder-30B-A3B (current) | 30.5B / 3.3B | 50.3–51.6% | yes, 13.81 GB |
+| **Qwen3.6-35B-A3B** | 35B / 3B | **73.4%** | yes at UD-Q3_K_XL, 16.8 GB |
+| Nemotron-Cascade-2-30B-A3B | 30B / 3B | 49.9% (pass@1) | yes, but see below |
+| Qwen3-Coder-Next | 80B / 3B | — | no (Q2_K_XL 29.3 GB, Q3_K_XL 36.3 GB) |
+
+Nemotron-Cascade-2 scores 87.2 on LiveCodeBench v6 — beating Kimi-K2.5-1T — but that is competitive
+programming, not agentic repository work, and its SWE-bench Verified is no better than the incumbent's.
+It is also a Mamba2 hybrid with an open llama.cpp assert bug
+([#20570](https://github.com/ggml-org/llama.cpp/issues/20570)). Good for algorithm problems, not for Cline.
+
+> **If you are moving to an AMD gfx906 card (MI50/MI60), read this first.** llama.cpp
+> [#19880](https://github.com/ggml-org/llama.cpp/issues/19880) reports that ROCm crashes with
+> `hipErrorInvalidDeviceFunction` on exactly the newer Qwen family — Qwen3.5-35B-A3B, Qwen3.5-27B,
+> Qwen3.5-122B-A10B and Qwen3-Coder-Next — while **Vulkan works**. The issue is still open. Combined
+> with ROCm 6.4+ shipping no gfx906 rocBLAS TensileLibrary, Vulkan is the backend to try first on that
+> hardware, alongside the gfx906-specific forks.
 
 ## Caveats
 
@@ -154,22 +256,29 @@ Full measurement logs, per-flag reasoning, and the complete benchmark appendix a
 ```bash
 ~/llama.cpp/build-cuda/bin/llama-server \
   -m ~/models/Qwen3-Coder-30B-A3B-Instruct-UD-Q3_K_XL.gguf \
-  -ngl 99 -ncmoe 32 -fa on -t 6 -lm none \
-  -c 36864 -ctk q8_0 -ctv q8_0 \
+  -ngl 99 -ncmoe 40 -fa on -t 6 -lm none -np 2 -kvu -ub 2048 \
+  -c 65536 -ctk q8_0 -ctv q8_0 \
   --temp 0.7 --top-p 0.8 --top-k 20 --repeat-penalty 1.05 --min-p 0.0 \
   --host 127.0.0.1 --port 8080
 ```
 
 - **양자화: UD-Q3_K_XL (13.81GB)**. Q4_K_M(18.56GB) → IQ4_XS(16.38GB) → UD-Q3_K_XL 순으로 내려왔음. 아래 "성능 병목 분석"에서 밝혔듯 **생성 속도가 메모리 대역폭에 묶여 있어서, 전문가 가중치가 작아지는 것이 그대로 속도가 됨**. IQ4_XS 대비 파일 16% 감소 → `ncmoe` 34→32 (GPU에 2레이어 더) → **생성 속도 +14~19%**. Unsloth UD(Dynamic) 계열은 중요 텐서를 고정밀로 유지해 3비트대에서도 품질 저하를 최소화함.
-- `-ngl 99 -ncmoe 32`: 최대한 GPU에 올리되, 전문가 레이어 32개는 CPU에 남김
+- `-ngl 99 -ncmoe 40`: 최대한 GPU에 올리되, 전문가 레이어 40개는 CPU에 남김. 32가 아니라 40인 이유는 `-ub 2048`을 태우기 위해서이며, 그 대가가 실질적으로 0인 것을 실측했습니다(아래 "에이전트 워크로드 튜닝" 참고)
+- **`-ub 2048`**: 물리 배치 크기. **프롬프트 처리 +77%(407 → 722 t/s)**, 생성 속도 손실은 측정 노이즈 이내. 이 구성에서 단일 변경으로 얻은 가장 큰 이득입니다
+- **`-np 2 -kvu`**: 슬롯 2개 + 통합 KV. 기본값 4슬롯은 서로의 20k+ 프롬프트 캐시를 축출합니다. **`-np`를 단독으로 주면 통합 KV가 조용히 꺼지면서** `-c 65536`이 슬롯당 32768로 반토막 나니 `-kvu`를 반드시 함께 주세요
 - `-ctk q8_0 -ctv q8_0`: KV 캐시 8비트 양자화 — 품질 손실 거의 없이 여유 확보, 프롬프트 처리 속도 34% 향상(360→483 t/s)의 부수 효과
 - `-lm none`: `mmap` 대신 전량 RAM 직접 로드 — CPU 오프로드 텐서의 페이지 폴트 오버헤드 제거
 - `-fa on`: Flash Attention, 품질 손실 없이 무료 속도 향상
-- `-c 36864`: Cline처럼 시스템 프롬프트가 긴 툴에서 25544토큰까지 요청이 커지는 걸 확인(`request (25544 tokens) exceeds the available context size (24576 tokens)`) → IQ4_XS + ncmoe=34 조합으로 36864까지 확장(요구치 대비 44% 여유), 생성 속도는 오히려 34.9 tok/s로 준수함
+- `-c 65536`: Cline처럼 시스템 프롬프트가 긴 툴에서 25544토큰까지 요청이 커지는 걸 확인(`request (25544 tokens) exceeds the available context size (24576 tokens)`). 초기에는 36864를 썼지만, 컨텍스트가 작을수록 Cline의 압축(condense)이 잦아지고 **압축 1회당 프롬프트 캐시가 통째로 무효화되어 40~70초를 뭅니다**. 벤치마크상 `-c 36864 -ncmoe 32`가 9% 빠르지만 그 이득으로 압축 1회를 갚으려면 생성 토큰 약 14,000개가 필요합니다 — 실측 세션은 36분간 2,905토큰을 생성했습니다
 - `-t 6`: 물리 코어 수. 하이퍼스레딩(12)을 켜면 오히려 생성 속도가 11% 느려짐(36.1→32.4 tok/s, 캐시 경합 추정) — 실측으로 확인
 - **`--temp 0.7 --top-p 0.8 --top-k 20 --repeat-penalty 1.05 --min-p 0.0`**: Qwen3-Coder 공식 권장 샘플링 값. llama-server 기본값(temp 0.80 / top_p 0.95 / top_k 40 / repeat 1.00)은 코딩 에이전트용으로 지나치게 무작위해서 잘못된 API·임포트를 생성할 여지가 큽니다. 속도 비용은 0이므로 반드시 지정하세요. **Cline은 샘플링 값을 명시 설정했을 때만 요청에 실어 보내므로**(전부 optional), 클라이언트에서 따로 지정하지 않으면 이 서버 기본값이 그대로 적용됩니다.
 - **KV 캐시를 `q4_0`으로 더 낮추는 것은 이 GPU에서 역효과**였음. `-ctv q4_0`은 컨텍스트를 36864→49152로 늘려주지만(같은 `ncmoe`에서), 동일 조건 비교에서 생성 속도가 44.8→38.8 tok/s로 **13.5% 느려집니다**. Turing(sm_75)에 q4_0 V캐시용 최적화된 flash-attention 경로가 없어 역양자화 비용을 그대로 무는 것으로 보입니다. K/V 모두 `q8_0` 유지가 정답.
-- 참고: `--parallel`(동시 슬롯 수)은 `kv_unified` 모드라 슬롯 수를 줄여도 VRAM 여유가 안 생김. 데스크톱 GPU 점유(Xorg/GNOME ~220MB)도 회수 시도했으나 이 CPU(i5-12400F "F"모델)는 내장 그래픽이 없어 구조적으로 불가능 — 컨텍스트를 늘리려면 `-ncmoe`를 올리거나 더 작은 양자화를 쓰는 것만 유효했음
+- 참고: `--parallel`(동시 슬롯 수)을 줄여도 **VRAM 여유는 안 생깁니다**(KV 풀 크기는 슬롯 수가 아니라 `-c`가 결정). 다만 캐시 적중률 때문에 줄일 가치가 있습니다 — 아래 "에이전트 워크로드 튜닝" 참고. 데스크톱 GPU 점유(Xorg/GNOME ~220MB)도 회수 시도했으나 이 CPU(i5-12400F "F"모델)는 내장 그래픽이 없어 구조적으로 불가능 — 컨텍스트를 늘리려면 `-ncmoe`를 올리거나 더 작은 양자화를 쓰는 것만 유효했음
+
+> **이전 리비전에서는 "Cline만 쓴다면 `-c 36864 -ncmoe 32`가 더 빠르다"고 적었습니다.**
+> `tg128` 기준으로는 9% 빠른 게 맞지만(45.3 vs 41.3 tok/s), 실제 세션 로그를 집계해 보니
+> 에이전트 클라이언트에는 잘못된 교환이었습니다. 아래 "에이전트 워크로드 튜닝"에 근거를 정리했습니다.
+> 압축이 일어나지 않는 짧은 컨텍스트 채팅 용도라면 `-c 36864 -ncmoe 32`가 여전히 더 빠릅니다.
 
 전체 실행 스크립트: [`scripts/run-server.sh`](scripts/run-server.sh)
 systemd 유저 서비스 유닛: [`scripts/llama-server.service`](scripts/llama-server.service)
@@ -206,6 +315,44 @@ DDR5-5600 싱글채널 이론 피크 44.8 GB/s의 약 65%로, 전형적인 실�
 - **CPU 코어 수를 늘려도 소용없음.** 위 스케일링 곡선이 보여주듯 이 워크로드는 연산이 아니라 대역폭에 묶여 있습니다.
 - **`-ot` 텐서 단위 세밀 오프로드는 이 구성에서 무의미했음.** 작은 컨텍스트에서는 `-ncmoe`보다 약 3% 빨랐지만(레이어 단위보다 촘촘하게 VRAM을 채울 수 있어서), 실제 운용 컨텍스트(36864)에서는 이미 VRAM이 포화라 모든 변형이 OOM이었습니다. 참고로 `-ot` 구분자는 `llama-bench`가 `;`, `llama-cli`/`llama-server`가 `,`로 서로 다릅니다.
 
+## 에이전트 워크로드 튜닝 — `tg128`이 말해주지 않는 것
+
+`llama-bench`의 `tg128`은 에이전트 세션의 체감과 다릅니다. 실제 Cline 트래픽 36분치를 서버 로그에서 집계한 결과입니다(`-c 65536 -ncmoe 38 -ub 512` 기준):
+
+| 구간 | 시간 | 토큰 | 속도 |
+|---|---:|---:|---:|
+| 프롬프트 처리 | 172.1 s | 56,032 | 326 t/s |
+| 생성 | 192.9 s | 2,905 | **15.1 tok/s** |
+
+두 가지가 드러납니다. 첫째, **22k 컨텍스트가 찬 상태의 생성 속도는 16~21 tok/s**이지 `tg128`의 45 tok/s가 아닙니다 — 컨텍스트 충전량이 지배하고 `ncmoe`는 거의 영향이 없습니다. 둘째, **프롬프트 처리가 벽시계 시간의 47%**이고 그 중 73%가 22~25k짜리 콜드 프롬프트 단 두 번(56초, 70초)이었습니다.
+
+따라서 실제로 의미 있는 레버는 **재처리를 피하는 것**과 **불가피한 재처리를 빠르게 만드는 것** 둘뿐입니다.
+
+### 배치 크기 `-ub` — 단일 변경 중 최대 이득
+
+MoE 오프로드에서 전문가 가중치는 ubatch당 한 번 RAM에서 읽혀 배치 내 모든 토큰에 상각됩니다. 즉 물리 배치를 키우면 대역폭 병목이 그대로 처리량으로 바뀝니다. 21,970토큰 고정 프롬프트, `cache_prompt: false`, 3회 중앙값:
+
+| `-ub` / `-ncmoe` | 프롬프트 처리 | 생성 @22k | VRAM |
+|---|---:|---:|---:|
+| 512 / 38 (이전) | 407 t/s | 21.02 tok/s | 7427 MiB |
+| 1024 / 38 | 573 t/s | 21.36 | 7551 |
+| 2048 / 38 | **OOM** — compute buffer 할당 실패 | — | — |
+| **2048 / 40 (채택)** | **722 t/s** | **21.11** | **7334** |
+| 2048 / 39 | 710 t/s | 20.92 | 7626 |
+| 4096 / 42 | 703 t/s | 20.21 | 6832 |
+
+`-ub 2048`은 `ncmoe 38`에서 VRAM이 모자라지만, 그 대가로 내주는 전문가 레이어 2개는 **사실상 공짜**입니다. 22k 컨텍스트에서 2레이어는 토큰당 시간의 1.9%로 측정 편차보다 작습니다. (짧은 컨텍스트에서는 분해가 되고 "레이어당 0.448 ms" 모델이 그대로 맞습니다 — `ncmoe 40`에서 실측 38.4 tok/s, 예측 38.9 tok/s.) 게다가 레이어 2개를 CPU로 내린 절감이 커진 compute buffer보다 커서 **VRAM이 오히려 줄었습니다**(7427 → 7334 MiB). `-ub 4096`은 무릎을 지난 지점이라 추가 이득이 없고 생성만 깎입니다.
+
+### 슬롯 수 `-np`
+
+기본값 4슬롯에서는 세션 로그의 슬롯 선택 18회 중 **14회가 LCP 매칭 실패 후 LRU 폴백**이었습니다. 18~25k짜리 서로 다른 대화 4개가 동시에 올라가 **87k 수요가 65k 통합 KV 풀을 초과**하며 서로를 축출한 것입니다. Cline은 대화 1개 + 소형 보조 요청만 동시에 보내므로 2슬롯이면 충분하고, 정확히 2개일 때는 LRU 특성상 보조 요청이 항상 *반대쪽* 슬롯으로 가서 메인 접두부가 보존됩니다. 슬롯 수는 어느 쪽이든 VRAM에 영향이 없습니다.
+
+> **`-np N`을 주면 통합 KV가 조용히 꺼집니다.** `--kv-unified`의 기본값이 "슬롯 수가 auto일 때만 활성"이라서, `-np 2`만 주면 `-c 65536`이 슬롯당 32768이 되고 컨텍스트 윈도우를 61440으로 설정한 클라이언트가 그대로 깨집니다. 반드시 `-kvu`를 함께 주세요.
+
+### 컨텍스트 크기 `-c`
+
+`-c`를 줄이면 `ncmoe`를 낮출 수 있어 벤치마크 기준 최대 9%를 법니다. 하지만 압축이 일어날 때마다 프롬프트 캐시가 무효화되며, 이는 원리적으로 회피 불가입니다(위 `--cache-reuse` 절). `-c 36864`는 Cline의 압축 임계를 29.5k에 놓는데 실측 세션은 이미 28.3k에 도달했습니다. 재구축 1회 비용이 40~70초이고, 약 20 tok/s에서 9%의 생성 이득으로 그 1회를 갚으려면 **생성 토큰 약 14,000개**가 필요합니다. 실측 세션은 36분 동안 2,905토큰을 생성했습니다.
+
 ## 상시 구동 (systemd)
 
 ```bash
@@ -230,7 +377,7 @@ models:
     model: qwen3-coder-30b-a3b
     apiBase: http://127.0.0.1:8080/v1
     apiKey: none
-    contextLength: 36864
+    contextLength: 61440
     capabilities:
       - tool_use   # 빠뜨리면 Continue.dev가 파일 읽기 등 에이전트/툴 기능을 아예 시도하지 않음
     roles:
@@ -268,7 +415,7 @@ Cline CLI를 쓴다면 `~/.cline/data/settings/providers.json`:
         "apiKey": "sk-no-key-required",
         "model": "Qwen3-Coder-30B-A3B-Instruct-UD-Q3_K_XL.gguf",
         "baseUrl": "http://127.0.0.1:8080/v1",
-        "contextWindow": 36864,
+        "contextWindow": 61440,
         "maxTokens": 4096
       }
     }
@@ -277,6 +424,8 @@ Cline CLI를 쓴다면 `~/.cline/data/settings/providers.json`:
 ```
 
 수정 후 Cline을 완전히 종료했다 재실행해야 반영됩니다(실행 중이면 종료 시 덮어씁니다).
+
+`contextWindow`는 서버 `-c` 값에서 `maxTokens`를 뺀 값으로 맞추세요. 현재 `-c 65536` / `maxTokens 4096` 이므로 **`61440`** 입니다. 필요 이상으로 작게 잡지 마세요 — 압축이 프롬프트 캐시를 파괴하므로, 작은 윈도우는 아끼는 것보다 훨씬 큰 비용을 물립니다(바로 아래 절 참고).
 
 참고로 서버 쪽에서 컨텍스트를 늘려 해결하려면 `ncmoe`를 올려야 해서 속도를 내줘야 합니다(UD-Q3_K_XL 기준 실측):
 
@@ -308,6 +457,45 @@ llama-server의 접두부 캐시는 **순차 대화에서 거의 완벽하게 �
 | 14543 | 43.1 초 |
 
 캐시 무효화는 주로 **Cline이 대화를 압축할 때** 일어납니다 — 앞부분 메시지가 요약본으로 교체되면서 접두부 자체가 바뀌기 때문에 구조적으로 회피할 수 없습니다. 그래서 `contextWindow`를 지나치게 작게 잡으면 압축이 잦아져 오히려 느려집니다. 서버 `-c` 값보다 약간 작게, 그러나 너무 작지 않게 잡는 것이 좋습니다.
+
+### `--cache-reuse`로는 해결되지 않음 (A/B 실측)
+
+llama-server의 `--cache-reuse N`은 접두부가 어긋나도 일치하는 청크를 찾아 KV를 새 위치로 이동시켜
+재사용하는 옵션입니다. 위의 압축 캐시 무효화를 완화할 유력한 후보로 보여서, 동일 워크로드
+(시스템 5,040토큰 + 대화 20,192토큰)로 서버를 두 번 기동해 A/B 했습니다.
+
+| 턴 | 없음 (재사용/재처리) | `--cache-reuse 256` (재사용/재처리) |
+|---|---:|---:|
+| 1. 최초 (cold) | 0 / 20,192 — 0% | 0 / 20,192 — 0% |
+| 2. 순차 대화 | 20,192 / 23 — 99.9% | 20,192 / 23 — 99.9% |
+| **3. 압축 직후** | **5,040 / 4,603 — 52.3%** | **5,040 / 4,603 — 52.3%** |
+| 4. 압축 후 순차 | 9,643 / 23 — 99.8% | 9,643 / 23 — 99.8% |
+
+**네 턴 모두 토큰 단위까지 완전히 동일합니다.** 효과가 정확히 0입니다.
+(2번 턴의 99.9%는 앞 절의 측정을 그대로 재현한 값입니다.)
+
+원인은 구현에 있습니다. `tools/server/server-context.cpp`의 `n_cache_reuse` 블록은 포인터 두 개로
+도는데, 캐시 쪽 `head_c`는 1씩 전진하지만 **프롬프트 쪽 `head_p`는 매치가 성립할 때만 전진**합니다.
+
+```
+while (head_c < cache.size() && head_p < prompt.size()) {
+    n_match = (캐시[head_c..] 와 프롬프트[head_p..] 의 연속 일치 길이)
+    if (n_match >= n_cache_reuse) { KV 시프트; head_c += n_match; head_p += n_match; }
+    else                          { head_c += 1; }   // head_p 는 그대로
+}
+```
+
+압축 시점에 `head_p`는 새로 삽입된 **요약문의 첫 토큰**에 놓입니다. 그 요약문은 캐시에 존재한 적이
+없으니 `n_cache_reuse` 이상의 일치가 영영 성립하지 않고, 루프는 `head_c`만 끝까지 훑다가 끝납니다.
+요약문 바로 뒤에 원문 그대로 남아 있는 최근 메시지 수천 토큰조차 **포인터가 요약문에 묶여
+도달하지 못합니다**.
+
+즉 이 옵션이 흡수할 수 있는 것은 캐시 내용의 **삭제**(뒤 내용이 앞으로 당겨지는 경우)뿐이고,
+Cline의 압축처럼 요약문이 **삽입**되는 변형은 원리적으로 대상이 아닙니다. 앞 절의 "구조적으로
+회피할 수 없다"가 코드 수준에서 확인된 셈입니다.
+
+실질적인 완화책은 여전히 **`contextWindow`를 서버 `-c`에 최대한 근접하게 잡아 압축 횟수 자체를
+줄이는 것**뿐입니다.
 
 ## 전체 벤치마크 로그
 
@@ -432,6 +620,40 @@ llama-server의 접두부 캐시는 **순차 대화에서 거의 완벽하게 �
 | Qwen2.5-Coder-7B (덴스, 전체 GPU) | 64.44 | 58.4 |
 
 > 7B가 raw 속도는 가장 빠르지만 버그 발생률 때문에 채택하지 않았습니다. 자세한 내용은 위 "모델 비교 벤치마크"와 "왜 MoE인가" 참고.
+
+## 2026년 8월 기준 모델 지형
+
+이 문서의 모델 선택은 2025년 중반 기준입니다. 이후 바뀐 것이 둘 있는데, 둘 다 "더 큰 MoE"는 아닙니다 — 다음 체급 MoE 중 32GB에 들어가는 것이 없고, 8GB는 더 말할 것도 없습니다.
+
+### 활성 파라미터가 같은 신형 — Qwen3.6-35B-A3B
+
+[Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF)(2026년 4월)는 활성 파라미터가 약 3B로 현재 모델과 같아 **속도 체급이 동일**한데, SWE-bench Verified가 **73.4%**로 현재 모델의 50.3~51.6%를 크게 앞섭니다.
+
+| | Qwen3-Coder-30B-A3B (현재) | Qwen3.6-35B-A3B |
+|---|---:|---:|
+| 총 / 활성 파라미터 | 30.5B / 3.3B | 35B / 3B |
+| SWE-bench Verified | 50.3~51.6% | **73.4%** |
+| Terminal-Bench 2.0 | — | 51.5% |
+| MCPMark (툴 사용) | — | 37.0% |
+| 네이티브 컨텍스트 | 262k | 262k (YaRN 1M+) |
+
+GGUF 크기: UD-Q2_K_XL 12.3GB / **UD-Q3_K_XL 16.8GB** / IQ4_XS 17.7GB / UD-Q4_K_XL 22.4GB / UD-Q5_K_M 26.5GB / UD-Q6_K 29.3GB.
+
+아키텍처가 Gated DeltaNet + Gated Attention 하이브리드라 **4개 레이어 중 1개만 풀 어텐션**입니다. 즉 KV 캐시가 훨씬 작아서, 위에서 다룬 압축(condense) 문제에 직접 유효합니다. 다만 UD-Q3_K_XL이 16.8GB로 현재 13.81GB보다 22% 크므로 8GB에서는 `ncmoe`를 올려야 합니다 — 그 교환이 남는 장사인지는 아래에서 실측합니다.
+
+에이전트 용도로는 **non-thinking 모드**를 쓰세요. 사고 토큰이 매 툴 콜마다 지연으로 쌓입니다.
+
+### 나머지는 사이드그레이드이거나 안 들어감
+
+**Nemotron-Cascade-2-30B-A3B**(NVIDIA, Mamba2-Transformer 하이브리드 MoE)는 LiveCodeBench v6에서 87.2로 Kimi-K2.5-1T(85.0)까지 제칩니다. 그러나 그건 경쟁 프로그래밍이고, **SWE-bench Verified는 pass@1 49.9로 현재 모델과 동급**입니다. Cline은 리포지토리 에이전트 작업이라 후자가 결정적입니다. 게다가 llama.cpp에 Mamba 관련 assert 버그([#20570](https://github.com/ggml-org/llama.cpp/issues/20570))가 열려 있습니다. 알고리즘 문제 풀이에는 좋지만 Cline용은 아닙니다.
+
+**Qwen3-Coder-Next(80B-A3B)** 는 진짜 상급 코더 MoE입니다(512 전문가 중 10개 활성, 256k 컨텍스트). 하지만 Q3_K_XL 36.3GB / Q4_K_M 48.5GB로 32GB에도 안 들어가고, Q2_K_XL 29.3GB는 KV 자리가 남지 않습니다. 64GB(예: MI50 2장)부터 현실적인 타깃입니다.
+
+### gfx906(MI50/MI60)으로 옮길 계획이라면 먼저 읽을 것
+
+llama.cpp [#19880](https://github.com/ggml-org/llama.cpp/issues/19880)에 따르면 **ROCm에서 신형 Qwen 계열이 크래시합니다** — `rocBLAS error ... 'hipErrorInvalidDeviceFunction':98`. 보고된 대상이 Qwen3.5-35B-A3B, Qwen3.5-27B, Qwen3.5-122B-A10B, Qwen3-Coder-Next로 **DeltaNet 하이브리드 계열 전부**이고, **Vulkan에서는 정상 동작**합니다. 이슈는 아직 열려 있습니다.
+
+ROCm 6.4+에 gfx906용 rocBLAS TensileLibrary가 아예 빠져 있다는 점까지 합치면, 이 하드웨어에서는 **Vulkan 백엔드를 1순위로** 두고 gfx906 전용 포크([iacopPBK/llama.cpp-gfx906](https://github.com/iacopPBK/llama.cpp-gfx906) 등)와 함께 비교하는 편이 현실적입니다.
 
 ## 알아둘 점 / 한계
 
