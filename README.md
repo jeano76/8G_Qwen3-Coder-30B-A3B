@@ -1,10 +1,10 @@
-# Running Qwen3-Coder-30B-A3B on an 8GB GPU
+# Running 30B-class MoE coding models on an 8GB GPU
 
-**English** | [한국어](#8gb-vram에서-qwen3-coder-30b-a3b-로컬-코딩-어시스턴트-구동하기)
+**English** | [한국어](#8gb-vram에서-30b급-moe-코딩-모델-구동하기)
 
-Measured notes and the final configuration for running a 30B-class coding LLM at usable speed on a single 8GB GPU. Every number below was measured on the machine described here — including the approaches that turned out to be slower.
+Measured notes and the running configuration for a 30B-class coding LLM at usable speed on a single 8GB GPU. Every number below was measured on the machine described here — including the approaches that turned out to be slower. The work started on Qwen3-Coder-30B-A3B; the current configuration runs Qwen3.6-35B-A3B, and both are documented.
 
-**Result: a 30.5B-parameter model on a GPU that cannot hold it** — 45.07 tok/s generation and 438.73 t/s prompt processing at benchmark context; 21.1 tok/s generation and 722 t/s prompt processing in a real 22K-token Cline session.
+**Result: a 35B-parameter model with a 128K context on a GPU that holds neither** — 36.4 tok/s generation and 839 t/s prompt processing at a real 22K-token Cline working context, up from 21.1 tok/s on the model this document started with.
 
 ## Hardware
 
@@ -32,7 +32,34 @@ The 32B dense model was unusable at 6 tok/s; the 7B was fast but produced buggie
 
 llama.cpp's `--n-cpu-moe` then keeps only part of the expert FFN weights in system RAM while attention and the rest stay on the GPU. That is what makes a 13.81GB model run on 8GB of VRAM.
 
-## Final configuration
+## Current configuration
+
+```bash
+llama-server \
+  -m Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf \
+  -ngl 99 -ncmoe 33 -fa on -t 6 -lm none -np 2 -kvu -ub 2048 \
+  -c 131072 -ctk q8_0 -ctv q8_0 -rea off \
+  --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 \
+  --host 127.0.0.1 --port 8080
+```
+
+This is [`scripts/run-server.sh`](scripts/run-server.sh). It replaced the Qwen3-Coder-30B-A3B
+configuration below after the [A/B](#model-landscape-august-2026) showed +72% generation, +16% prompt
+processing and twice the context at the same VRAM. Everything this document establishes about `-ub`,
+`-np`, `-lm`, `-t` and the KV cache carries over unchanged — only the model, `-ncmoe`, `-c` and the
+sampling values differ.
+
+| Flag | Why |
+|---|---|
+| `-ncmoe 33` | Keep 33 of 40 layers' expert weights on the CPU. The OOM floor at this context is 32 |
+| `-c 131072` | Costs 2.4% against 65536 and puts Cline's condense threshold at 114K, so prompt-cache rebuilds stop happening. Affordable because only 10 of 40 layers run full attention |
+| `-rea off` | Disable thinking. Thought tokens are latency on every single tool call in an agent loop |
+| sampling flags | The model's own recommended values, from its GGUF metadata. **Not** Qwen3-Coder's 0.7 / 0.8 / 1.05 |
+
+### Previous configuration (Qwen3-Coder-30B-A3B)
+
+Kept because most of the analysis below was measured on it, and it is still the right choice if you
+want a coder-tuned model at a smaller download.
 
 ```bash
 llama-server \
@@ -45,7 +72,7 @@ llama-server \
 
 | Flag | Why |
 |---|---|
-| `-ncmoe 40` | Keep 40 layers' expert weights on the CPU; everything else on the GPU |
+| `-ncmoe 40` | Keep 40 of 48 layers' expert weights on the CPU; everything else on the GPU |
 | `-ub 2048` | Physical batch size. **+77% prompt processing** (407 → 722 t/s) at no measurable cost to generation — the largest single win for an agent workload |
 | `-np 2 -kvu` | Two slots, unified KV. The default of four slots evicts its own 20K+ prompt caches; `-np` alone silently turns unified KV *off* and halves per-slot context |
 | `-c 65536` | Large enough that Cline rarely has to condense — each condense costs a 40–70 s prompt-cache rebuild |
@@ -154,8 +181,8 @@ Raising `-c` by itself does not fix this — Cline fills whatever it is given (r
   "provider": "openai-compatible",
   "baseUrl": "http://127.0.0.1:8080/v1",
   "apiKey": "sk-no-key-required",
-  "model": "Qwen3-Coder-30B-A3B-Instruct-UD-Q3_K_XL.gguf",
-  "contextWindow": 61440,
+  "model": "Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf",
+  "contextWindow": 126976,
   "maxTokens": 4096
 }
 ```
@@ -231,7 +258,7 @@ Full measurement logs, per-flag reasoning, and the complete benchmark appendix a
 
 ---
 
-# 8GB VRAM에서 Qwen3-Coder-30B-A3B 로컬 코딩 어시스턴트 구동하기
+# 8GB VRAM에서 30B급 MoE 코딩 모델 구동하기
 
 [English](#running-qwen3-coder-30b-a3b-on-an-8gb-gpu) | **한국어**
 
@@ -274,7 +301,30 @@ Full measurement logs, per-flag reasoning, and the complete benchmark appendix a
 - 32B 덴스 모델에는 소형 드래프트 모델(Qwen2.5-Coder-0.5B)이 유효했음(6.06 tok/s, 품질 손실 없음)
 - 그러나 Qwen3-Coder-30B-A3B에는 **역효과**였음 — MoE 오프로드로 이미 CPU가 바쁜 상태에서 드래프트 모델까지 같은 CPU 코어를 두고 경쟁하며 오히려 17.3 tok/s로 느려짐. 이 조합에서는 추측 디코딩을 쓰지 않는 것이 최적.
 
-## 최종 설정
+## 현재 설정
+
+```bash
+~/llama.cpp/build-cuda/bin/llama-server \
+  -m ~/models/Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf \
+  -ngl 99 -ncmoe 33 -fa on -t 6 -lm none -np 2 -kvu -ub 2048 \
+  -c 131072 -ctk q8_0 -ctv q8_0 -rea off \
+  --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 \
+  --host 127.0.0.1 --port 8080
+```
+
+체크인된 [`scripts/run-server.sh`](scripts/run-server.sh)가 이 설정입니다. 아래 "2026년 8월 기준 모델 지형"의 A/B 실측에서 동일 VRAM으로 **생성 +72%, 프롬프트 처리 +16%, 컨텍스트 2배**가 확인되어 Qwen3-Coder-30B-A3B 설정을 대체했습니다.
+
+- `-ncmoe 33`: 40개 레이어 중 33개의 전문가 가중치를 CPU에. 이 컨텍스트에서 OOM 바닥은 32입니다
+- `-c 131072`: 65536 대비 2.4% 비용으로 Cline 압축 임계를 114k로 올려 캐시 재구축을 없앱니다. 40개 중 10개만 풀 어텐션이라 감당 가능합니다
+- `-rea off`: thinking 차단. 에이전트 루프에서는 사고 토큰이 매 툴 콜마다 지연으로 쌓입니다
+- 샘플링 `--temp 1.0 --top-p 0.95 --top-k 20`: GGUF 메타데이터의 모델 권장값입니다. Qwen3-Coder용 0.7 / 0.8 / 1.05가 **아닙니다**
+- cline `contextWindow`는 **126976**(= 131072 − 4096)
+
+`-ub 2048`, `-np 2 -kvu`, `-lm none`, `-t 6`, KV 캐시 `q8_0` 등 이 문서가 확립한 나머지 결론은 그대로 유효합니다 — 모델과 `-ncmoe`, `-c`, 샘플링 값만 달라집니다.
+
+### 이전 설정 (Qwen3-Coder-30B-A3B)
+
+아래 분석 대부분이 이 모델에서 측정된 것이라 함께 남겨둡니다. 더 작은 다운로드로 코더 전용 튜닝 모델을 쓰고 싶다면 여전히 유효한 선택입니다.
 
 ```bash
 ~/llama.cpp/build-cuda/bin/llama-server \
@@ -400,7 +450,7 @@ models:
     model: qwen3-coder-30b-a3b
     apiBase: http://127.0.0.1:8080/v1
     apiKey: none
-    contextLength: 61440
+    contextLength: 126976
     capabilities:
       - tool_use   # 빠뜨리면 Continue.dev가 파일 읽기 등 에이전트/툴 기능을 아예 시도하지 않음
     roles:
@@ -436,9 +486,9 @@ Cline CLI를 쓴다면 `~/.cline/data/settings/providers.json`:
       "settings": {
         "provider": "openai-compatible",
         "apiKey": "sk-no-key-required",
-        "model": "Qwen3-Coder-30B-A3B-Instruct-UD-Q3_K_XL.gguf",
+        "model": "Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf",
         "baseUrl": "http://127.0.0.1:8080/v1",
-        "contextWindow": 61440,
+        "contextWindow": 126976,
         "maxTokens": 4096
       }
     }
@@ -448,7 +498,7 @@ Cline CLI를 쓴다면 `~/.cline/data/settings/providers.json`:
 
 수정 후 Cline을 완전히 종료했다 재실행해야 반영됩니다(실행 중이면 종료 시 덮어씁니다).
 
-`contextWindow`는 서버 `-c` 값에서 `maxTokens`를 뺀 값으로 맞추세요. 현재 `-c 65536` / `maxTokens 4096` 이므로 **`61440`** 입니다. 필요 이상으로 작게 잡지 마세요 — 압축이 프롬프트 캐시를 파괴하므로, 작은 윈도우는 아끼는 것보다 훨씬 큰 비용을 물립니다(바로 아래 절 참고).
+`contextWindow`는 서버 `-c` 값에서 `maxTokens`를 뺀 값으로 맞추세요. 현재 `-c 131072` / `maxTokens 4096` 이므로 **`126976`** 입니다. 필요 이상으로 작게 잡지 마세요 — 압축이 프롬프트 캐시를 파괴하므로, 작은 윈도우는 아끼는 것보다 훨씬 큰 비용을 물립니다(바로 아래 절 참고).
 
 참고로 서버 쪽에서 컨텍스트를 늘려 해결하려면 `ncmoe`를 올려야 해서 속도를 내줘야 합니다(UD-Q3_K_XL 기준 실측):
 
