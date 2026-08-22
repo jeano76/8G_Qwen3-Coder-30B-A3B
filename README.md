@@ -177,6 +177,29 @@ is far smaller — directly useful against the condense problem above. UD-Q3_K_X
 current 13.81 GB, so `ncmoe` has to rise; whether that trade is worth it on 8GB is measured below.
 Use its non-thinking mode for agent work — thinking tokens are latency on every tool call.
 
+**Measured on this machine.** Qwen3.6-35B-A3B UD-Q3_K_XL (16.85 GB) was benchmarked against the
+incumbent on the same fixed 21,970-token prompt, same `-ub 2048 -np 2 -kvu`, median of 3:
+
+| Model | `-c` / `-ncmoe` | Prompt processing | Generation @22K | VRAM |
+|---|---|---:|---:|---:|
+| Qwen3-Coder-30B-A3B UD-Q3_K_XL | 65536 / 40 | 722 t/s | 21.11 tok/s | 7334 MiB |
+| Qwen3.6-35B-A3B UD-Q3_K_XL | 65536 / 30 | 879 t/s | **37.26 tok/s** | 7472 MiB |
+| **Qwen3.6-35B-A3B UD-Q3_K_XL** | **131072 / 33** | **839 t/s** | **36.38 tok/s** | **7439 MiB** |
+| Qwen3.6-35B-A3B UD-Q3_K_XL | 262144 / 40 | 759 t/s | 33.59 tok/s | 7031 MiB |
+
+The bigger file needs *fewer* CPU-resident layers, not more: with only 10 full-attention layers the KV
+cache at 65536 is ~0.71 GB against ~3.4 GB for the incumbent, and each active expert is 12.1 MB per
+layer per token against 17.1 MB. Halving CPU-side RAM traffic is where the **+72% generation** comes
+from. Generation is also nearly flat in context — 36.4 tok/s at 22K against 32.4 tok/s at short context,
+because 30 of 40 layers carry a constant-size recurrent state instead of a growing KV cache.
+
+That flatness is what makes `-c 131072` nearly free (−2.4% against 65536) and worth taking: it puts
+Cline's condense threshold at 114K, so the 40–70 s prompt-cache rebuilds stop happening at all.
+`-c 262144` fits too, at `-ncmoe 40`, but costs 8% for headroom no observed session needs.
+
+VRAM per offloaded layer measured 313 MiB, and the OOM floors are sharp: `-c 65536` fails at
+`-ncmoe 29`, `-c 131072` at 32, `-c 262144` at 37.
+
 **Everything else in reach is a sidegrade or does not fit.**
 
 | Model | Total / active | SWE-bench Verified | Fits 8GB + 32GB RAM? |
@@ -642,6 +665,29 @@ GGUF 크기: UD-Q2_K_XL 12.3GB / **UD-Q3_K_XL 16.8GB** / IQ4_XS 17.7GB / UD-Q4_K
 아키텍처가 Gated DeltaNet + Gated Attention 하이브리드라 **4개 레이어 중 1개만 풀 어텐션**입니다. 즉 KV 캐시가 훨씬 작아서, 위에서 다룬 압축(condense) 문제에 직접 유효합니다. 다만 UD-Q3_K_XL이 16.8GB로 현재 13.81GB보다 22% 크므로 8GB에서는 `ncmoe`를 올려야 합니다 — 그 교환이 남는 장사인지는 아래에서 실측합니다.
 
 에이전트 용도로는 **non-thinking 모드**를 쓰세요. 사고 토큰이 매 툴 콜마다 지연으로 쌓입니다.
+
+### 실측 A/B — 이 머신에서 직접 측정
+
+동일한 21,970토큰 고정 프롬프트, 동일한 `-ub 2048 -np 2 -kvu`, 3회 중앙값입니다.
+
+| 모델 | `-c` / `-ncmoe` | 프롬프트 처리 | 생성 @22k | 단컨텍스트 생성 | VRAM |
+|---|---|---:|---:|---:|---:|
+| Qwen3-Coder-30B-A3B UD-Q3_K_XL | 65536 / 40 | 722 t/s | 21.11 tok/s | 38.4 tok/s | 7334 MiB |
+| Qwen3.6-35B-A3B UD-Q3_K_XL | 65536 / 32 | 844 t/s | 36.43 tok/s | 33.7 tok/s | 6845 MiB |
+| Qwen3.6-35B-A3B UD-Q3_K_XL | 65536 / 30 | 879 t/s | **37.26 tok/s** | 34.7 tok/s | 7472 MiB |
+| **Qwen3.6-35B-A3B UD-Q3_K_XL** | **131072 / 33** | **839 t/s** | **36.38 tok/s** | 32.4 tok/s | **7439 MiB** |
+| Qwen3.6-35B-A3B UD-Q3_K_XL | 131072 / 34 | 809 t/s | 35.58 tok/s | 32.1 tok/s | 7110 MiB |
+| Qwen3.6-35B-A3B UD-Q3_K_XL | 262144 / 40 | 759 t/s | 33.59 tok/s | 25.6 tok/s | 7031 MiB |
+
+OOM 경계는 명확합니다: `-c 65536`은 `-ncmoe 29`에서, `-c 131072`는 32에서, `-c 262144`는 37에서 실패합니다. 오프로드 레이어당 VRAM은 실측 **313 MiB**였습니다(GGUF 헤더에서 균등 분배로 추정한 387 MiB보다 작음 — UD 계열이 레이어별로 비트를 다르게 할당하기 때문).
+
+**파일이 22% 큰데 `ncmoe`는 오히려 10 낮습니다.** 풀 어텐션이 40개 중 10개뿐이라 65536 KV가 약 0.71GB로, 기존 모델의 3.4GB 대비 2.7GB가 그대로 남기 때문입니다. 여기에 활성 전문가가 레이어·토큰당 12.1MB(기존 17.1MB)라 CPU가 읽는 양이 절반으로 줄고, 그것이 **생성 +72%**의 정체입니다.
+
+**생성 속도가 컨텍스트에 거의 평평합니다.** 22k에서 36.4 tok/s, 짧은 컨텍스트에서 32.4 tok/s로 오히려 긴 쪽이 빠릅니다. 40개 중 30개 레이어가 커지는 KV 대신 **고정 크기 순환 상태**를 쓰기 때문입니다. 기존 모델은 짧은 컨텍스트 38.4 → 22k에서 21.1로 반토막이 났습니다.
+
+이 평평함 덕분에 `-c 131072`가 65536 대비 **−2.4%**밖에 안 되고, 그래서 취할 값어치가 있습니다 — Cline의 압축 임계가 114k로 올라가 이 문서의 핵심 비용이던 40~70초짜리 캐시 재구축이 **아예 발생하지 않게** 됩니다. `-c 262144`도 `-ncmoe 40`으로 들어가지만, 관측된 어떤 세션도 필요로 하지 않는 여유를 위해 8%를 내주는 선택입니다.
+
+전환 시 서버 플래그 두 개가 추가로 필요합니다. **`-rea off`** — thinking 토큰이 매 툴 콜마다 지연으로 쌓이므로 에이전트 용도에서는 꺼야 합니다(끈 상태에서 `reasoning_content: None`, 툴 콜 정상 동작 확인). 그리고 샘플링은 GGUF 메타데이터의 모델 권장값인 **`--temp 1.0 --top-p 0.95 --top-k 20`** 으로 바꿔야 합니다 — Qwen3-Coder용 0.7/0.8/1.05가 아닙니다.
 
 ### 나머지는 사이드그레이드이거나 안 들어감
 
