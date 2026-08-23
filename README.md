@@ -406,6 +406,7 @@ task queue, which is exactly the thing that gets stuck.
 | Cross-check | Before restarting, grep the journal for `release: id` / `print_timing` in the last 6 min. A long prompt eval makes `/slots` slow but leaves progress logs — restarting that would kill live work |
 | Cooldown | 15 min between restarts, max 3 per hour, then it stops and asks for a human |
 | Loading | `/health` reporting `Loading model` resets the counter; a cold load takes 30–60s |
+| Config drift | Compares the running server's `-c` with Cline's `contextWindow` + `maxTokens` and warns at most once an hour when they disagree. A stale `contextWindow` is what produces `exceeds the available context size`, and one set too small burns the prompt cache on needless condenses |
 
 ### The pressure log
 
@@ -925,6 +926,7 @@ cat /sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/cgroup.c
 | 교차 확인 | 재시작 전에 최근 6분 저널에서 `release: id` / `print_timing`을 찾습니다. 긴 프롬프트 평가 중이면 `/slots`는 느려도 진행 로그는 남습니다 — 그걸 재시작하면 멀쩡한 작업을 죽입니다 |
 | 쿨다운 | 재시작 간 15분, 시간당 최대 3회, 넘으면 중단하고 사람을 부릅니다 |
 | 로딩 중 | `/health`가 `Loading model`이면 카운터 초기화. 콜드 로드는 30~60초 걸립니다 |
+| 설정 드리프트 | 실행 중인 서버의 `-c`와 Cline의 `contextWindow` + `maxTokens`를 비교해 어긋나면 최대 1시간에 한 번 경고합니다. 낡은 `contextWindow`가 `exceeds the available context size`를 만들고, 반대로 너무 작게 잡으면 불필요한 압축이 프롬프트 캐시를 태웁니다 |
 
 ### 압력 로그
 

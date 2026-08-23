@@ -20,6 +20,9 @@ FAIL_FILE="$STATE_DIR/consecutive_failures"
 HIST_FILE="$STATE_DIR/restart_history"     # 재시작 epoch 목록 (한 줄에 하나)
 PRESSURE_LOG="$STATE_DIR/pressure.log"     # 프리즈 사후 분석용 압력 샘플
 PRESSURE_LOG_MAX="${PRESSURE_LOG_MAX:-5242880}"   # 5MB 넘으면 .1 로 회전
+CLINE_PROVIDERS="${CLINE_PROVIDERS:-$HOME/.cline/data/settings/providers.json}"
+DRIFT_FILE="$STATE_DIR/ctx_drift_warned"   # 마지막 불일치 경고 epoch
+DRIFT_QUIET="${DRIFT_QUIET:-3600}"         # 같은 불일치는 1시간에 한 번만 경고
 mkdir -p "$STATE_DIR"
 
 log() { echo "[watchdog] $*"; }
@@ -89,6 +92,60 @@ sample_pressure() {
 read_fails() { [ -f "$FAIL_FILE" ] && cat "$FAIL_FILE" 2>/dev/null || echo 0; }
 reset_fails() { echo 0 > "$FAIL_FILE"; }
 
+# ── 컨텍스트 설정 드리프트 검사 ────────────────────────────────────────────
+# 서버 -c 를 바꾸고 Cline 쪽 contextWindow 를 안 고치면, Cline 은 없는 창을
+# 있다고 믿고 대화를 키우다 서버에서 하드 에러를 맞는다:
+#   error: request (67992 tokens) exceeds the available context size (65536 tokens)
+# 2026-08-23 에 -c 를 131072 -> 65536 으로 내리면서 실제로 이 일이 났다.
+# 반대로 너무 작게 잡아도 손해다 - 불필요한 압축이 프롬프트 캐시를 버린다.
+check_context_drift() {
+  [ -f "$CLINE_PROVIDERS" ] || return 0
+
+  local pid ctx vals cw mt pct msg now last
+  pid=$(systemctl --user show "$UNIT" -p MainPID --value 2>/dev/null || echo 0)
+  [ -n "${pid:-}" ] && [ "$pid" != "0" ] || return 0
+
+  # 실행 중인 프로세스의 실제 -c (스크립트가 아니라 프로세스가 진실이다)
+  ctx=$(tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null \
+        | awk '$0=="-c" || $0=="--ctx-size" { getline; print; exit }')
+  [ -n "${ctx:-}" ] || return 0
+
+  vals=$(python3 - "$CLINE_PROVIDERS" <<'PY' 2>/dev/null || true
+import json, sys
+d = json.load(open(sys.argv[1]))
+for prov in d.get("providers", {}).values():
+    s = prov.get("settings", {})
+    if "127.0.0.1:8080" in s.get("baseUrl", ""):
+        print(s.get("contextWindow", 0), s.get("maxTokens", 0))
+        break
+PY
+)
+  [ -n "${vals:-}" ] || return 0
+  set -- $vals; cw=$1; mt=$2
+  [ "${cw:-0}" -gt 0 ] 2>/dev/null || return 0
+
+  msg=""
+  if [ $(( cw + mt )) -gt "$ctx" ]; then
+    msg="Cline contextWindow($cw) + maxTokens($mt) 가 서버 -c ($ctx) 를 넘는다. 대화가 커지면 'exceeds the available context size' 하드 에러가 난다. contextWindow 를 $(( ctx - mt )) 로 맞출 것"
+  else
+    pct=$(( (cw + mt) * 100 / ctx ))
+    if [ "$pct" -lt 75 ]; then
+      msg="Cline contextWindow($cw) + maxTokens($mt) 가 서버 -c ($ctx) 의 ${pct}% 뿐이다. 압축이 불필요하게 자주 돌아 프롬프트 캐시를 버린다. contextWindow $(( ctx - mt )) 권장"
+    fi
+  fi
+
+  if [ -z "$msg" ]; then
+    rm -f "$DRIFT_FILE"
+    return 0
+  fi
+
+  now=$(date +%s)
+  last=$(cat "$DRIFT_FILE" 2>/dev/null || echo 0)
+  [ $(( now - ${last:-0} )) -lt "$DRIFT_QUIET" ] && return 0
+  echo "$now" > "$DRIFT_FILE"
+  log "경고: $msg"
+}
+
 # 프로브보다 먼저 샘플을 남긴다. 프로브가 걸린 채 머신이 죽어도 직전 상태는 남는다.
 sample_pressure
 
@@ -98,6 +155,8 @@ if ! systemctl --user is-active --quiet "$UNIT"; then
   reset_fails
   exit 0
 fi
+
+check_context_drift
 
 # 모델 로딩 중(503)은 정상 상태다. 로딩에 30~60초가 걸린다.
 health=$(curl -s -m 5 "$ENDPOINT/health" 2>/dev/null || true)
