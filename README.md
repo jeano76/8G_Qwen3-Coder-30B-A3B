@@ -4,7 +4,9 @@
 
 Measured notes and the running configuration for a 30B-class coding LLM at usable speed on a single 8GB GPU. Every number below was measured on the machine described here — including the approaches that turned out to be slower. The work started on Qwen3-Coder-30B-A3B; the current configuration runs Qwen3.6-35B-A3B, and both are documented.
 
-**Result: a 35B-parameter model with a 128K context on a GPU that holds neither** — 36.4 tok/s generation and 839 t/s prompt processing at a real 22K-token Cline working context, up from 21.1 tok/s on the model this document started with.
+**Result: a 35B-parameter model with a 64K context on a GPU that holds neither** — 38.2 tok/s generation and 970 t/s prompt processing at a real 22K-token Cline working context, up from 21.1 tok/s on the model this document started with.
+
+The context was 128K until a session that actually filled it exhausted host RAM and froze the machine. That is documented in [Host RAM](#host-ram-the-failure-mode-vram-numbers-do-not-predict), along with the measurement that shows 64K costs nothing to give up.
 
 ## Hardware
 
@@ -38,7 +40,7 @@ llama.cpp's `--n-cpu-moe` then keeps only part of the expert FFN weights in syst
 llama-server \
   -m Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf \
   -ngl 99 -ncmoe 33 -fa on -t 6 -lm none -np 2 -kvu -ub 2048 \
-  -c 131072 -ctk q8_0 -ctv q8_0 -sps 0.5 -rea off \
+  -c 65536 -ctk q8_0 -ctv q8_0 -sps 0.5 -rea off \
   --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 \
   --host 127.0.0.1 --port 8080
 ```
@@ -52,7 +54,7 @@ sampling values differ.
 | Flag | Why |
 |---|---|
 | `-ncmoe 33` | Keep 33 of 40 layers' expert weights on the CPU. The OOM floor at this context is 32 |
-| `-c 131072` | Costs 2.4% against 65536 and puts Cline's condense threshold at 114K, so prompt-cache rebuilds stop happening. Affordable because only 10 of 40 layers run full attention |
+| `-c 65536` | Puts Cline's condense threshold at 61K — still far above the 28.3K that observed sessions actually reach, so prompt-cache rebuilds stop happening. Was 131072 until a full 128K context OOM'd the host; see [Host RAM](#host-ram-the-failure-mode-vram-numbers-do-not-predict) |
 | `-sps 0.5` | Slot-prompt similarity floor. The default of 0.10 lets a barely-related prompt claim a slot holding a 60K cache and destroy it |
 | `-rea off` | Disable thinking. Thought tokens are latency on every single tool call in an agent loop |
 | sampling flags | The model's own recommended values, from its GGUF metadata. **Not** Qwen3-Coder's 0.7 / 0.8 / 1.05 |
@@ -235,6 +237,94 @@ puts Cline's condense threshold at 29.5K, and observed sessions already reach 28
 40–70 s; at ~20 tok/s, a 9% generation gain needs roughly 14,000 generated tokens to pay for a single
 one. The measured session generated 2,905 tokens in 36 minutes.
 
+That argument still holds, and it is why `-c` here is 65536 rather than something small. What it
+missed is the host-RAM ceiling — see the next section.
+
+## Host RAM: the failure mode VRAM numbers do not predict
+
+Every tuning number above is about VRAM and throughput. The configuration that came out of it ran
+fine for hours and then froze the entire machine. The cause was host RAM, and it is worth documenting
+because none of the measurements above would have predicted it.
+
+**What happened.** After roughly ten hours of continuous Cline use at `-c 131072`, the kernel
+OOM-killed the server:
+
+```
+Out of memory: Killed process (llama-server)
+  anon-rss:9,091,004kB  shmem-rss:12,436,992kB      # 21.5GB resident
+Free swap = 0kB   Total swap = 0kB
+```
+
+On a 32GB machine with no swap that is not a clean process kill. The kernel spent minutes evicting
+page cache and re-reading it before it gave up, and during that window the desktop stopped repainting
+and input stopped registering. The machine looked like a hardware fault. It was not: temperatures were
+normal and SMART was clean on both SSDs.
+
+**Why the earlier measurements missed it.** The KV cache is not allocated up front. It grows with the
+tokens actually resident, so at a realistic working context all three settings measure the same:
+
+| `-c` | VRAM at load | Peak host RSS at a 21.5K working context |
+|---|---:|---:|
+| 32768 | 5,791 MiB | 11.6 GB |
+| 65536 | 6,259 MiB | 12.2 GB |
+| 131072 | 7,221 MiB | 11.6 GB |
+
+Measured with `scripts/bench-prompt.txt` (21,547 prompt tokens), reading `memory.peak` from the
+service's cgroup. The spread across the three is measurement noise, not signal — that is the point.
+`-c 131072` looks free at this working context; the bill only arrives after a long session has
+actually filled the window, which is exactly when the anon-rss above reached 9GB.
+
+So `-c` sets a *ceiling* that is invisible at benchmark time. 65536 keeps the condense threshold
+above what sessions actually reach while halving that ceiling.
+
+### What dropping to 65536 costs: nothing measurable
+
+Re-benchmarked back to back on the final configuration, three runs each
+(`./scripts/bench-model.sh <model> 33 2048 <ctx> <label> 3`, llama.cpp build `07822bd`):
+
+| `-c` | Prompt processing | Generation @22K | Generation, short ctx | VRAM |
+|---|---:|---:|---:|---:|
+| **65536** | **970.0 t/s** | **38.19 tok/s** | 42.9 tok/s | **6,319 MiB** |
+| 131072 | 970.2 t/s | 38.32 tok/s | 43.1 tok/s | 7,281 MiB |
+
+0.3% on generation, nothing on prompt processing — below run-to-run variance — and 962 MiB of VRAM
+back. This **supersedes the −2.4% figure** recorded in the benchmark appendix below, which was measured
+on an older llama.cpp build; on the current build the two contexts are indistinguishable at a realistic
+working context. The trade documented earlier ("131072 is nearly free, take it") no longer has a
+throughput argument on either side, and 65536 wins on both VRAM and the host-RAM ceiling.
+
+Both figures are also faster than the 839 t/s / 36.38 tok/s recorded earlier in this document, on the
+same hardware and prompt. That gain is the llama.cpp build, not this configuration change.
+
+**The fix that actually matters is not the context size.** Two things bound the blast radius:
+
+```ini
+# scripts/llama-server.service
+MemoryHigh=16G
+MemoryMax=20G
+MemorySwapMax=4G
+Restart=on-failure
+SuccessExitStatus=SIGKILL     # do not restart into the same OOM
+```
+
+`MemoryMax` turns a system-wide freeze into a single service being killed. `SuccessExitStatus=SIGKILL`
+matters just as much: the original unit had `Restart=always`, so systemd restarted the server five
+seconds after the OOM kill and it began reloading a 16GB model into a machine that had just run out of
+memory. The freeze that followed was the second attempt, not the first.
+
+The other half is swap. This machine had none, which is why memory pressure became a livelock instead
+of a kill. 12GB of zram (zstd) costs no disk and compresses the anon pages this workload produces:
+
+```ini
+# /etc/systemd/zram-generator.conf
+[zram0]
+zram-fraction = 0.4
+max-zram-size = 12288
+compression-algorithm = zstd
+```
+
+With both in place the same overcommit ends as a log line instead of a hard reset.
+
 ## Client setup (Cline)
 
 Point any OpenAI-compatible client at `http://127.0.0.1:8080/v1`. For Cline, **`contextWindow` must be set** — without it Cline grows conversations unbounded until the server hard-errors:
@@ -251,7 +341,7 @@ Raising `-c` by itself does not fix this — Cline fills whatever it is given (r
   "baseUrl": "http://127.0.0.1:8080/v1",
   "apiKey": "sk-no-key-required",
   "model": "Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf",
-  "contextWindow": 126976,
+  "contextWindow": 61440,
   "maxTokens": 4096
 }
 ```
@@ -283,15 +373,25 @@ incumbent on the same fixed 21,970-token prompt, same `-ub 2048 -np 2 -kvu`, med
 | **Qwen3.6-35B-A3B UD-Q3_K_XL** | **131072 / 33** | **839 t/s** | **36.38 tok/s** | **7439 MiB** |
 | Qwen3.6-35B-A3B UD-Q3_K_XL | 262144 / 40 | 759 t/s | 33.59 tok/s | 7031 MiB |
 
+> **These are the original measurements, kept as recorded.** The bolded row was the running
+> configuration when they were taken. It is no longer: the current one is `65536 / 33`, re-measured on
+> a newer llama.cpp build at 970 t/s and 38.19 tok/s. See
+> [What dropping to 65536 costs](#what-dropping-to-65536-costs-nothing-measurable).
+
 The bigger file needs *fewer* CPU-resident layers, not more: with only 10 full-attention layers the KV
 cache at 65536 is ~0.71 GB against ~3.4 GB for the incumbent, and each active expert is 12.1 MB per
 layer per token against 17.1 MB. Halving CPU-side RAM traffic is where the **+72% generation** comes
 from. Generation is also nearly flat in context — 36.4 tok/s at 22K against 32.4 tok/s at short context,
 because 30 of 40 layers carry a constant-size recurrent state instead of a growing KV cache.
 
-That flatness is what makes `-c 131072` nearly free (−2.4% against 65536) and worth taking: it puts
-Cline's condense threshold at 114K, so the 40–70 s prompt-cache rebuilds stop happening at all.
+That flatness makes a large `-c` nearly free in *throughput* terms (`-c 131072` costs −2.4% against
+65536), and pushing Cline's condense threshold up is what stops the 40–70 s prompt-cache rebuilds.
 `-c 262144` fits too, at `-ncmoe 40`, but costs 8% for headroom no observed session needs.
+
+> This conclusion held on throughput and VRAM, and it is why the running configuration used
+> `-c 131072` for a time. It was wrong about host RAM: a session that actually filled 128K reached
+> 21.5GB resident and took the machine down. The current value is 65536 —
+> see [Host RAM](#host-ram-the-failure-mode-vram-numbers-do-not-predict).
 
 VRAM per offloaded layer measured 313 MiB, and the OOM floors are sharp: `-c 65536` fails at
 `-ncmoe 29`, `-c 131072` at 32, `-c 262144` at 37.
@@ -322,6 +422,7 @@ It is also a Mamba2 hybrid with an open llama.cpp assert bug
 - This is a compromise shaped by 8GB of VRAM. With a larger card the model fits entirely in VRAM, `--n-cpu-moe` drops toward 0, and the RAM-bandwidth bottleneck disappears.
 - Generated code still needs review. Bugs were found in the 7B and 14B output (missing imports, non-existent parameter names); 30B-A3B was the most reliable but not infallible.
 - `llama-cli` / `llama-bench` and `llama-server` use different default context and batch sizes, so the same `-ncmoe` can fit in one and OOM in another. Leave headroom when changing values.
+- Benchmark numbers do not predict host-RAM exhaustion. Everything here fits in VRAM by construction, but a long session at a large `-c` can still take down a 32GB machine. Set `MemoryMax` on the service and give the host swap before treating any of this as stable — see [Host RAM](#host-ram-the-failure-mode-vram-numbers-do-not-predict).
 
 Full measurement logs, per-flag reasoning, and the complete benchmark appendix are in the Korean document below.
 
@@ -376,7 +477,7 @@ Full measurement logs, per-flag reasoning, and the complete benchmark appendix a
 ~/llama.cpp/build-cuda/bin/llama-server \
   -m ~/models/Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf \
   -ngl 99 -ncmoe 33 -fa on -t 6 -lm none -np 2 -kvu -ub 2048 \
-  -c 131072 -ctk q8_0 -ctv q8_0 -sps 0.5 -rea off \
+  -c 65536 -ctk q8_0 -ctv q8_0 -sps 0.5 -rea off \
   --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 \
   --host 127.0.0.1 --port 8080
 ```
@@ -384,11 +485,11 @@ Full measurement logs, per-flag reasoning, and the complete benchmark appendix a
 체크인된 [`scripts/run-server.sh`](scripts/run-server.sh)가 이 설정입니다. 아래 "2026년 8월 기준 모델 지형"의 A/B 실측에서 동일 VRAM으로 **생성 +72%, 프롬프트 처리 +16%, 컨텍스트 2배**가 확인되어 Qwen3-Coder-30B-A3B 설정을 대체했습니다.
 
 - `-ncmoe 33`: 40개 레이어 중 33개의 전문가 가중치를 CPU에. 이 컨텍스트에서 OOM 바닥은 32입니다
-- `-c 131072`: 65536 대비 2.4% 비용으로 Cline 압축 임계를 114k로 올려 캐시 재구축을 없앱니다. 40개 중 10개만 풀 어텐션이라 감당 가능합니다
+- `-c 65536`: Cline 압축 임계를 61k에 놓습니다. 실측 세션이 실제로 도달하는 28.3k보다 한참 위라 캐시 재구축이 일어나지 않습니다. 131072를 쓰다가 128k를 실제로 채운 세션이 호스트를 OOM으로 몰아 낮췄습니다([호스트 RAM](#호스트-ram--vram-수치가-예측해주지-않는-고장) 절)
 - **`-sps 0.5`**: 슬롯 재사용 최소 유사도. 기본값 0.10은 거의 무관한 프롬프트가 6만 토큰 캐시를 들고 있는 슬롯을 차지해 파괴하도록 허용합니다(아래 절 참고)
 - `-rea off`: thinking 차단. 에이전트 루프에서는 사고 토큰이 매 툴 콜마다 지연으로 쌓입니다
 - 샘플링 `--temp 1.0 --top-p 0.95 --top-k 20`: GGUF 메타데이터의 모델 권장값입니다. Qwen3-Coder용 0.7 / 0.8 / 1.05가 **아닙니다**
-- cline `contextWindow`는 **126976**(= 131072 − 4096)
+- cline `contextWindow`는 **61440**(= 65536 − 4096)
 
 `-ub 2048`, `-np 2 -kvu`, `-lm none`, `-t 6`, KV 캐시 `q8_0` 등 이 문서가 확립한 나머지 결론은 그대로 유효합니다 — 모델과 `-ncmoe`, `-c`, 샘플링 값만 달라집니다.
 
@@ -433,7 +534,7 @@ systemd 유저 서비스 유닛: [`scripts/llama-server.service`](scripts/llama-
 ```bash
 # 고정 프롬프트(scripts/bench-prompt.txt, 약 22K 토큰) 벤치마크
 systemctl --user stop llama-server
-./scripts/bench-model.sh ~/models/Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf 33 2048 131072 mylabel
+./scripts/bench-model.sh ~/models/Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf 33 2048 65536 mylabel
 systemctl --user start llama-server
 
 # 실제 세션 저널 집계 (세션 시작 시각을 인자로)
@@ -562,6 +663,84 @@ f_sim_best = 0.100 (> 0.100 thold)  → 55,876토큰 재처리, 81.9초
 
 `-c`를 줄이면 `ncmoe`를 낮출 수 있어 벤치마크 기준 최대 9%를 법니다. 하지만 압축이 일어날 때마다 프롬프트 캐시가 무효화되며, 이는 원리적으로 회피 불가입니다(위 `--cache-reuse` 절). `-c 36864`는 Cline의 압축 임계를 29.5k에 놓는데 실측 세션은 이미 28.3k에 도달했습니다. 재구축 1회 비용이 40~70초이고, 약 20 tok/s에서 9%의 생성 이득으로 그 1회를 갚으려면 **생성 토큰 약 14,000개**가 필요합니다. 실측 세션은 36분 동안 2,905토큰을 생성했습니다.
 
+## 호스트 RAM — VRAM 수치가 예측해주지 않는 고장
+
+위의 모든 튜닝 수치는 VRAM과 처리량에 관한 것입니다. 그렇게 얻은 설정은 **몇 시간을 멀쩡히 돌다가 머신 전체를 얼어붙게 만들었습니다.** 원인은 호스트 RAM이었고, 위의 어떤 측정으로도 예측되지 않았기 때문에 기록해 둡니다.
+
+### 무슨 일이 있었나
+
+`-c 131072`로 Cline을 약 10시간 연속 사용한 뒤 커널이 서버를 OOM 킬했습니다:
+
+```
+Out of memory: Killed process (llama-server)
+  anon-rss:9,091,004kB  shmem-rss:12,436,992kB      # 상주 21.5GB
+Free swap = 0kB   Total swap = 0kB
+```
+
+**스왑이 0인 32GB 머신에서 이건 깔끔한 프로세스 종료가 아닙니다.** 커널은 포기하기까지 수 분 동안 페이지 캐시를 버리고 다시 읽기를 반복했고(스래싱), 그 사이 데스크톱은 다시 그려지지 않고 입력도 먹지 않았습니다. 겉보기엔 하드웨어 고장 같았지만 아니었습니다 — 온도는 정상이었고 SSD 두 개 모두 SMART는 깨끗했습니다.
+
+### 왜 앞의 측정으로는 못 잡았나
+
+**KV 캐시는 미리 할당되지 않습니다.** 실제로 상주하는 토큰 수에 따라 늘어나므로, 현실적인 작업 컨텍스트에서는 세 설정이 모두 같게 측정됩니다:
+
+| `-c` | 로드 직후 VRAM | 21.5k 작업 컨텍스트에서 호스트 RSS 피크 |
+|---|---:|---:|
+| 32768 | 5,791 MiB | 11.6 GB |
+| 65536 | 6,259 MiB | 12.2 GB |
+| 131072 | 7,221 MiB | 11.6 GB |
+
+`scripts/bench-prompt.txt`(프롬프트 21,547토큰)로 측정, 서비스 cgroup의 `memory.peak` 판독. 세 값의 차이는 신호가 아니라 측정 노이즈이며, **그게 바로 요점입니다.** 이 작업 컨텍스트에서 `-c 131072`는 공짜처럼 보입니다. 청구서는 긴 세션이 실제로 창을 채운 뒤에야 도착하고, 그 시점이 위 anon-rss가 9GB에 도달한 순간입니다.
+
+즉 `-c`는 **벤치마크 시점에는 보이지 않는 천장**을 설정합니다. 65536은 압축 임계를 실측 세션이 도달하는 값보다 위에 두면서 그 천장을 절반으로 낮춥니다.
+
+### 65536으로 내리는 비용 — 측정되지 않음
+
+최종 설정에서 연속 재측정, 각 3회 (`./scripts/bench-model.sh <model> 33 2048 <ctx> <label> 3`, llama.cpp 빌드 `07822bd`):
+
+| `-c` | 프롬프트 처리 | 생성 @22k | 생성, 짧은 컨텍스트 | VRAM |
+|---|---:|---:|---:|---:|
+| **65536** | **970.0 t/s** | **38.19 tok/s** | 42.9 tok/s | **6,319 MiB** |
+| 131072 | 970.2 t/s | 38.32 tok/s | 43.1 tok/s | 7,281 MiB |
+
+생성 0.3%, 프롬프트 처리는 차이 없음 — 측정 편차 이하입니다. 대신 VRAM 962 MiB를 돌려받습니다. 이 결과는 아래 벤치마크 부록에 기록된 **−2.4% 수치를 대체합니다.** 그 값은 더 오래된 llama.cpp 빌드에서 측정한 것이고, 현재 빌드에서는 현실적인 작업 컨텍스트에서 두 설정을 구분할 수 없습니다. 앞서 문서화한 절충("131072가 거의 공짜니 취한다")은 이제 양쪽 어디에도 처리량 근거가 없으며, 65536이 VRAM과 호스트 RAM 천장 양쪽에서 이깁니다.
+
+두 값 모두 이 문서 앞부분에 기록된 839 t/s / 36.38 tok/s보다 빠릅니다. 하드웨어와 프롬프트는 동일하므로 그 이득은 이 설정 변경이 아니라 **llama.cpp 빌드** 덕분입니다.
+
+### 실제로 중요한 건 컨텍스트 크기가 아니다
+
+피해 범위를 가두는 건 다음 두 가지입니다:
+
+```ini
+# scripts/llama-server.service
+MemoryHigh=16G
+MemoryMax=20G
+MemorySwapMax=4G
+Restart=on-failure
+SuccessExitStatus=SIGKILL     # 같은 OOM으로 재시작하지 않는다
+```
+
+`MemoryMax`는 시스템 전체 프리즈를 **서비스 하나가 죽는 일**로 바꿉니다. `SuccessExitStatus=SIGKILL`도 그만큼 중요합니다 — 원래 유닛은 `Restart=always`였고, 그래서 OOM 킬 5초 뒤 systemd가 서버를 재시작해 **방금 메모리가 바닥난 머신에 16GB 모델을 다시 로드하기 시작했습니다.** 뒤이은 프리즈는 첫 번째가 아니라 두 번째 시도였습니다.
+
+나머지 절반은 스왑입니다. 이 머신엔 스왑이 없었고, 그래서 메모리 압박이 프로세스 종료가 아니라 **라이브락**이 됐습니다. zram 12GB(zstd)는 디스크를 쓰지 않고 이 워크로드가 만드는 anon 페이지를 잘 압축합니다:
+
+```ini
+# /etc/systemd/zram-generator.conf
+[zram0]
+zram-fraction = 0.4
+max-zram-size = 12288
+compression-algorithm = zstd
+```
+
+```bash
+sudo apt install systemd-zram-generator
+sudo systemctl daemon-reload
+sudo systemctl start systemd-zram-setup@zram0.service
+```
+
+> 우분투 24.04의 `systemd-zram-generator` 0.3.2는 `zram-size` 키를 **모릅니다.** 그 키를 쓰면 조용히 무시하고 기본값(램의 절반, 최대 4096MB)으로 잡습니다. 위처럼 `zram-fraction` + `max-zram-size`를 쓰세요. 크기를 바꾼 뒤에는 `--reset-device zram0`을 거쳐야 반영됩니다.
+
+둘을 모두 걸어두면 동일한 과할당이 하드 리셋이 아니라 로그 한 줄로 끝납니다.
+
 ## 상시 구동 (systemd)
 
 ```bash
@@ -573,6 +752,13 @@ loginctl enable-linger $(whoami)   # 로그아웃 후에도 계속 구동
 ```
 
 OpenAI 호환 API가 `http://127.0.0.1:8080/v1`에서 제공됩니다.
+
+체크인된 유닛에는 위 절의 `MemoryMax`/`SuccessExitStatus`가 포함되어 있습니다. 사용자 유닛에 `MemoryMax`가 실제로 걸리려면 메모리 컨트롤러가 위임돼 있어야 합니다 — 확인:
+
+```bash
+cat /sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/cgroup.controllers
+# memory 가 목록에 있어야 한다
+```
 
 ## VSCode 연동 (Continue.dev)
 
@@ -586,7 +772,7 @@ models:
     model: qwen3-coder-30b-a3b
     apiBase: http://127.0.0.1:8080/v1
     apiKey: none
-    contextLength: 126976
+    contextLength: 61440
     capabilities:
       - tool_use   # 빠뜨리면 Continue.dev가 파일 읽기 등 에이전트/툴 기능을 아예 시도하지 않음
     roles:
@@ -624,7 +810,7 @@ Cline CLI를 쓴다면 `~/.cline/data/settings/providers.json`:
         "apiKey": "sk-no-key-required",
         "model": "Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf",
         "baseUrl": "http://127.0.0.1:8080/v1",
-        "contextWindow": 126976,
+        "contextWindow": 61440,
         "maxTokens": 4096
       }
     }
@@ -634,7 +820,7 @@ Cline CLI를 쓴다면 `~/.cline/data/settings/providers.json`:
 
 수정 후 Cline을 완전히 종료했다 재실행해야 반영됩니다(실행 중이면 종료 시 덮어씁니다).
 
-`contextWindow`는 서버 `-c` 값에서 `maxTokens`를 뺀 값으로 맞추세요. 현재 `-c 131072` / `maxTokens 4096` 이므로 **`126976`** 입니다. 필요 이상으로 작게 잡지 마세요 — 압축이 프롬프트 캐시를 파괴하므로, 작은 윈도우는 아끼는 것보다 훨씬 큰 비용을 물립니다(바로 아래 절 참고).
+`contextWindow`는 서버 `-c` 값에서 `maxTokens`를 뺀 값으로 맞추세요. 현재 `-c 65536` / `maxTokens 4096` 이므로 **`61440`** 입니다. 필요 이상으로 작게 잡지 마세요 — 압축이 프롬프트 캐시를 파괴하므로, 작은 윈도우는 아끼는 것보다 훨씬 큰 비용을 물립니다(바로 아래 절 참고).
 
 참고로 서버 쪽에서 컨텍스트를 늘려 해결하려면 `ncmoe`를 올려야 해서 속도를 내줘야 합니다(UD-Q3_K_XL 기준 실측):
 
@@ -865,13 +1051,17 @@ GGUF 크기: UD-Q2_K_XL 12.3GB / **UD-Q3_K_XL 16.8GB** / IQ4_XS 17.7GB / UD-Q4_K
 | Qwen3.6-35B-A3B UD-Q3_K_XL | 131072 / 34 | 809 t/s | 35.58 tok/s | 32.1 tok/s | 7110 MiB |
 | Qwen3.6-35B-A3B UD-Q3_K_XL | 262144 / 40 | 759 t/s | 33.59 tok/s | 25.6 tok/s | 7031 MiB |
 
+> **위는 당시 측정값 그대로입니다.** 굵게 표시된 행은 측정 시점의 운용 설정이었고, 지금은 아닙니다. 현재 운용 설정은 `65536 / 33`이며 더 새로운 llama.cpp 빌드에서 **970 t/s, 38.19 tok/s**로 재측정됐습니다([65536으로 내리는 비용](#65536으로-내리는-비용--측정되지-않음) 절).
+
 OOM 경계는 명확합니다: `-c 65536`은 `-ncmoe 29`에서, `-c 131072`는 32에서, `-c 262144`는 37에서 실패합니다. 오프로드 레이어당 VRAM은 실측 **313 MiB**였습니다(GGUF 헤더에서 균등 분배로 추정한 387 MiB보다 작음 — UD 계열이 레이어별로 비트를 다르게 할당하기 때문).
 
 **파일이 22% 큰데 `ncmoe`는 오히려 10 낮습니다.** 풀 어텐션이 40개 중 10개뿐이라 65536 KV가 약 0.71GB로, 기존 모델의 3.4GB 대비 2.7GB가 그대로 남기 때문입니다. 여기에 활성 전문가가 레이어·토큰당 12.1MB(기존 17.1MB)라 CPU가 읽는 양이 절반으로 줄고, 그것이 **생성 +72%**의 정체입니다.
 
 **생성 속도가 컨텍스트에 거의 평평합니다.** 22k에서 36.4 tok/s, 짧은 컨텍스트에서 32.4 tok/s로 오히려 긴 쪽이 빠릅니다. 40개 중 30개 레이어가 커지는 KV 대신 **고정 크기 순환 상태**를 쓰기 때문입니다. 기존 모델은 짧은 컨텍스트 38.4 → 22k에서 21.1로 반토막이 났습니다.
 
-이 평평함 덕분에 `-c 131072`가 65536 대비 **−2.4%**밖에 안 되고, 그래서 취할 값어치가 있습니다 — Cline의 압축 임계가 114k로 올라가 이 문서의 핵심 비용이던 40~70초짜리 캐시 재구축이 **아예 발생하지 않게** 됩니다. `-c 262144`도 `-ncmoe 40`으로 들어가지만, 관측된 어떤 세션도 필요로 하지 않는 여유를 위해 8%를 내주는 선택입니다.
+이 평평함 덕분에 큰 `-c`는 **처리량 기준으로는** 거의 공짜입니다(`-c 131072`가 65536 대비 −2.4%). 압축 임계를 올려 40~70초짜리 캐시 재구축을 없애는 이득도 그대로입니다. `-c 262144`도 `-ncmoe 40`으로 들어가지만, 관측된 어떤 세션도 필요로 하지 않는 여유를 위해 8%를 내주는 선택입니다.
+
+> 이 결론은 처리량과 VRAM에 대해서는 맞았고, 그래서 한동안 `-c 131072`로 운용했습니다. **호스트 RAM에 대해서는 틀렸습니다** — 128k를 실제로 채운 세션이 상주 21.5GB에 도달해 머신을 통째로 멈췄습니다. 현재 값은 65536입니다([호스트 RAM](#호스트-ram--vram-수치가-예측해주지-않는-고장) 절).
 
 전환 시 서버 플래그 두 개가 추가로 필요합니다. **`-rea off`** — thinking 토큰이 매 툴 콜마다 지연으로 쌓이므로 에이전트 용도에서는 꺼야 합니다(끈 상태에서 `reasoning_content: None`, 툴 콜 정상 동작 확인). 그리고 샘플링은 GGUF 메타데이터의 모델 권장값인 **`--temp 1.0 --top-p 0.95 --top-k 20`** 으로 바꿔야 합니다 — Qwen3-Coder용 0.7/0.8/1.05가 아닙니다.
 

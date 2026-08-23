@@ -1,11 +1,24 @@
 [Unit]
-Description=llama.cpp server (Qwen3-Coder-30B-A3B, local coding assistant)
+Description=llama.cpp server (Qwen3.6-35B-A3B, local coding assistant)
 After=network.target
+# 5분 내 3회 실패하면 재시작 포기. 메모리가 모자란 상태에서
+# 재시작을 반복하면 로드할 때마다 다시 OOM을 유발한다.
+StartLimitIntervalSec=300
+StartLimitBurst=3
 
 [Service]
 ExecStart=%h/llama.cpp/scripts/run-server.sh
+
+# 호스트 RAM 상한. 이걸 걸지 않으면 컨텍스트가 가득 찬 세션이
+# 시스템 전체를 OOM으로 몰아 머신이 얼어붙는다(README "호스트 RAM" 절).
+MemoryHigh=16G
+MemoryMax=20G
+MemorySwapMax=4G
+
+# OOM(SIGKILL)으로 죽었을 때는 재시작하지 않는다.
 Restart=on-failure
-RestartSec=5
+RestartSec=15
+SuccessExitStatus=SIGKILL
 
 [Install]
 WantedBy=default.target
