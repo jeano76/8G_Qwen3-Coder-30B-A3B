@@ -1,0 +1,11 @@
+[Unit]
+Description=llama-server 워치독 주기 실행 (60초)
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=60s
+AccuracySec=5s
+Unit=llama-watchdog.service
+
+[Install]
+WantedBy=timers.target

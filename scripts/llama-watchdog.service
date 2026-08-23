@@ -1,0 +1,9 @@
+[Unit]
+Description=llama-server 스톨 감지 워치독
+After=llama-server.service
+
+[Service]
+Type=oneshot
+ExecStart=%h/bin/llama-watchdog.sh
+# 프로브 타임아웃 + 재시작 시간을 넉넉히 덮는 상한
+TimeoutStartSec=180

@@ -350,6 +350,54 @@ compression-algorithm = zstd
 
 With both in place the same overcommit ends as a log line instead of a hard reset.
 
+## Watchdog: the server hangs instead of crashing
+
+`Restart=on-failure` only helps if the process dies. This one does not always die — on 2026-08-23 it
+stopped answering for **21 minutes 30 seconds** while the process stayed alive and systemd stayed
+happy. The naive health check does not catch it either: `/health` is a plain handler that never
+touches the inference loop, so it returns 200 from a wedged server. `/slots` goes through the main
+task queue, which is exactly the thing that gets stuck.
+
+[`scripts/llama-watchdog.sh`](scripts/llama-watchdog.sh), run every 60s by
+[`scripts/llama-watchdog.timer`](scripts/llama-watchdog.timer):
+
+| Step | Behaviour |
+|---|---|
+| Probe | `GET /slots`, 15s timeout, must parse as a JSON array |
+| Threshold | 5 consecutive failures (5 minutes) before anything happens |
+| Cross-check | Before restarting, grep the journal for `release: id` / `print_timing` in the last 6 min. A long prompt eval makes `/slots` slow but leaves progress logs — restarting that would kill live work |
+| Cooldown | 15 min between restarts, max 3 per hour, then it stops and asks for a human |
+| Loading | `/health` reporting `Loading model` resets the counter; a cold load takes 30–60s |
+
+### The pressure log
+
+A hard freeze takes the last seconds of the journal with it. That is why the 22:39 freeze above is
+recorded as unexplained — there was simply nothing in the log. So the watchdog also writes one line
+per tick to `~/.local/state/llama-watchdog/pressure.log` **and fsyncs it**:
+
+```
+2026-08-23T22:57:42+09:00 state=active cur=16.00G high=3116 max=0 oomk=0 anon=0.30G
+  file=15.61G majflt=755 cg_mem=0.00/0.00 cg_io=0.00/0.00 sys_mem=0.00/0.00
+  sys_io=0.00/0.00 avail=16.47G swapfree=12.00G
+```
+
+`sync -d` on every line is the whole point — without it the log lives in page cache and dies with the
+machine exactly like the journal did. `high`/`max`/`oomk` are the cgroup's `memory.events` counters,
+`cg_*`/`sys_*` are PSI stall percentages as `avg10/avg60`, and `sys_io` is the *full* share (every task
+blocked on I/O), which is what a reclaim livelock looks like from outside. The tick is 60s, so the last
+sample before a freeze can be a minute old — `avg60` is there to cover that minute. The sample is taken
+*before* the probe, so a machine that dies mid-probe still leaves its last state behind. On a confirmed
+stall the last three samples are copied into the journal, because restarting resets the cgroup counters.
+
+Install:
+
+```bash
+mkdir -p ~/bin ~/.config/systemd/user
+cp scripts/llama-watchdog.sh ~/bin/ && chmod +x ~/bin/llama-watchdog.sh
+cp scripts/llama-watchdog.{service,timer} ~/.config/systemd/user/
+systemctl --user daemon-reload && systemctl --user enable --now llama-watchdog.timer
+```
+
 ## Client setup (Cline)
 
 Point any OpenAI-compatible client at `http://127.0.0.1:8080/v1`. For Cline, **`contextWindow` must be set** — without it Cline grows conversations unbounded until the server hard-errors:
@@ -796,6 +844,41 @@ OpenAI 호환 API가 `http://127.0.0.1:8080/v1`에서 제공됩니다.
 ```bash
 cat /sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/cgroup.controllers
 # memory 가 목록에 있어야 한다
+```
+
+## 워치독 — 서버는 크래시가 아니라 "행"으로 죽는다
+
+`Restart=on-failure`는 프로세스가 죽어야 작동합니다. 그런데 이 서버는 늘 죽지 않습니다 — 2026-08-23에는 프로세스가 살아 있고 systemd도 만족한 채로 **21분 30초** 동안 응답만 하지 않았습니다. 단순한 헬스체크로도 못 잡습니다: `/health`는 추론 루프를 거치지 않는 단순 핸들러라 행 상태에서도 200을 돌려줍니다. `/slots`는 메인 태스크 큐를 경유하며, 막히는 게 바로 그 큐입니다.
+
+[`scripts/llama-watchdog.sh`](scripts/llama-watchdog.sh), 60초마다 [`scripts/llama-watchdog.timer`](scripts/llama-watchdog.timer)가 실행:
+
+| 단계 | 동작 |
+|---|---|
+| 프로브 | `GET /slots`, 15초 타임아웃, JSON 배열로 파싱돼야 통과 |
+| 임계 | 연속 5회 실패(5분) 전에는 아무것도 하지 않음 |
+| 교차 확인 | 재시작 전에 최근 6분 저널에서 `release: id` / `print_timing`을 찾습니다. 긴 프롬프트 평가 중이면 `/slots`는 느려도 진행 로그는 남습니다 — 그걸 재시작하면 멀쩡한 작업을 죽입니다 |
+| 쿨다운 | 재시작 간 15분, 시간당 최대 3회, 넘으면 중단하고 사람을 부릅니다 |
+| 로딩 중 | `/health`가 `Loading model`이면 카운터 초기화. 콜드 로드는 30~60초 걸립니다 |
+
+### 압력 로그
+
+하드 프리즈는 저널의 마지막 수 초를 가져갑니다. 위 22:39 프리즈가 원인 미상으로 남은 이유가 그거였습니다 — 로그에 아무것도 없었습니다. 그래서 워치독은 매 틱마다 한 줄을 `~/.local/state/llama-watchdog/pressure.log`에 쓰고 **즉시 fsync**합니다:
+
+```
+2026-08-23T22:57:42+09:00 state=active cur=16.00G high=3116 max=0 oomk=0 anon=0.30G
+  file=15.61G majflt=755 cg_mem=0.00/0.00 cg_io=0.00/0.00 sys_mem=0.00/0.00
+  sys_io=0.00/0.00 avail=16.47G swapfree=12.00G
+```
+
+**매 줄의 `sync -d`가 핵심입니다.** 이게 없으면 이 로그도 페이지 캐시에만 남아 저널과 똑같이 머신과 함께 사라집니다. `high`/`max`/`oomk`는 cgroup의 `memory.events` 카운터, `cg_*`/`sys_*`는 PSI stall 비율을 `avg10/avg60`으로, `sys_io`는 `full`(모든 태스크가 I/O에 막힌 비율)입니다 — 회수 라이브락이 밖에서 보이는 모습이 이 값입니다. 틱이 60초라 프리즈 직전 샘플이 최대 1분 오래된 값일 수 있는데, `avg60`이 그 1분을 덮으라고 있습니다. 샘플은 프로브 **전에** 뜨므로 프로브 도중에 머신이 죽어도 직전 상태는 남습니다. 스톨이 확정돼 재시작할 때는 최근 3줄을 저널에도 복사합니다 — 재시작하면 cgroup 카운터가 0으로 리셋되기 때문입니다.
+
+설치:
+
+```bash
+mkdir -p ~/bin ~/.config/systemd/user
+cp scripts/llama-watchdog.sh ~/bin/ && chmod +x ~/bin/llama-watchdog.sh
+cp scripts/llama-watchdog.{service,timer} ~/.config/systemd/user/
+systemctl --user daemon-reload && systemctl --user enable --now llama-watchdog.timer
 ```
 
 ## VSCode 연동 (Continue.dev)
