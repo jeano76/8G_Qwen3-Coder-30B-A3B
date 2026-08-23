@@ -400,7 +400,7 @@ VRAM per offloaded layer measured 313 MiB, and the OOM floors are sharp: `-c 655
 
 | Model | Total / active | SWE-bench Verified | Fits 8GB + 32GB RAM? |
 |---|---|---:|---|
-| Qwen3-Coder-30B-A3B (current) | 30.5B / 3.3B | 50.3–51.6% | yes, 13.81 GB |
+| Qwen3-Coder-30B-A3B (previous) | 30.5B / 3.3B | 50.3–51.6% | yes, 13.81 GB |
 | **Qwen3.6-35B-A3B** | 35B / 3B | **73.4%** | yes at UD-Q3_K_XL, 16.8 GB |
 | Nemotron-Cascade-2-30B-A3B | 30B / 3B | 49.9% (pass@1) | yes, but see below |
 | Qwen3-Coder-Next | 80B / 3B | — | no (Q2_K_XL 29.3 GB, Q3_K_XL 36.3 GB) |
@@ -430,7 +430,7 @@ Full measurement logs, per-flag reasoning, and the complete benchmark appendix a
 
 # 8GB VRAM에서 30B급 MoE 코딩 모델 구동하기
 
-[English](#running-qwen3-coder-30b-a3b-on-an-8gb-gpu) | **한국어**
+[English](#running-30b-class-moe-coding-models-on-an-8gb-gpu) | **한국어**
 
 단일 8GB급 GPU(NVIDIA RTX 2070 SUPER)에서 실사용 가능한 속도로 로컬 코딩 LLM을 돌리기 위한 실험 기록과 최종 설정입니다. 여러 모델 크기(7B/14B/32B/MoE)를 직접 벤치마크하고, 8GB VRAM 제약 아래 속도와 코드 품질의 균형점을 찾았습니다.
 
@@ -767,9 +767,9 @@ cat /sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/cgroup.c
 
 ```yaml
 models:
-  - name: Qwen3-Coder-30B-A3B (local)
+  - name: Qwen3.6-35B-A3B (local)
     provider: openai
-    model: qwen3-coder-30b-a3b
+    model: Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf
     apiBase: http://127.0.0.1:8080/v1
     apiKey: none
     contextLength: 61440
