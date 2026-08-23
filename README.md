@@ -337,6 +337,44 @@ exactly like the freeze the limit was meant to prevent — and it is self-inflic
 10GB free the whole time. Size `MemoryHigh` above the model plus everything around it and keep
 `MemoryMax` as the hard backstop; on this 32GB machine that is 24G and 26G.
 
+### Verifying it: a 20-minute session that actually fills the window
+
+The numbers above are a ceiling argument, so they were checked against a real full-window run.
+[`scripts/agent-load.py`](scripts/agent-load.py) drives the API the way Cline does — grow the
+conversation, inject a tool result each turn, condense when it approaches the cap — for 20 minutes:
+
+| | |
+|---|---:|
+| Turns / condenses | 161 / 10 |
+| Largest prompt | **63,294 tokens** (the 64K window, actually filled) |
+| Failed turns | **0** |
+| `memory.peak` | **24.00 GiB** |
+| `memory.events` `max` / `oom_kill` | **0 / 0** |
+| PSI (cgroup and system) | 0.00 throughout |
+| Lowest `MemAvailable` | 7.86 GB |
+
+```
+23:07:24 cur=20.16G high=3116 anon=4.43G file=15.63G majflt=987  avail=12.09G
+23:11:44 cur=23.01G high=3116 anon=7.28G file=15.63G majflt=996  avail= 9.46G
+23:13:49 cur=23.69G high=3204 anon=8.47G file=15.12G majflt=996  avail= 8.24G   <- reaches the ceiling
+23:14:52 cur=24.00G high=3212 anon=8.83G file=15.06G majflt=996  avail= 7.87G
+23:21:19 cur=23.75G high=3229 anon=8.68G file=14.97G majflt=996  avail= 8.05G
+```
+
+Under the old limits `MemoryHigh=16G` was passed at 23:03 and `MemoryMax=20G` at 23:07; this run would
+have been an OOM kill. It was not — the backstop never fired.
+
+**But 24G is not generous.** A session that fills 64K wants roughly 24.5 GB (8.86 GB anon on top of the
+15.7 GB model), so from 23:13 the cgroup sat *at* `MemoryHigh` and the `high` counter started moving
+again — 113 events in eight minutes, with `file` trimmed from 15.63 GB to 14.97 GB.
+
+That is fine, and the difference from the earlier stall is the whole point: `pgmajfault` rose by **9**.
+The kernel dropped cache it did not need back, rather than re-reading the model on every pass (3116
+events in three minutes, idle, when the limit was 16G). `MemoryHigh` behaved as the soft ceiling it is
+supposed to be. Raising it further on a 32GB host would push the desktop's headroom under 5GB and
+recreate the same failure from the other side, so 24G/26G stays. If long sessions feel slow late, read
+the `high` growth rate and the `file` shrink in `pressure.log` first — that is this ceiling being hit.
+
 The other half is swap. This machine had none, which is why memory pressure became a livelock instead
 of a kill. 12GB of zram (zstd) costs no disk and compresses the anon pages this workload produces:
 
@@ -806,6 +844,34 @@ memory.stat:    file 16.75GB / anon 0.32GB, pgsteal 3.19M pages
 ```
 
 서버가 자기 가중치를 버렸다가 SSD에서 다시 읽기를 끝없이 반복합니다. 이건 상한이 막으려던 프리즈와 **똑같아 보이는 스톨**이고, 그 내내 호스트에는 10GB가 남아 있었으니 자초한 것입니다. `MemoryHigh`는 모델 + 주변 할당을 모두 담을 만큼 잡고, `MemoryMax`를 하드 백스톱으로 남기세요. 이 32GB 머신에서는 24G / 26G입니다.
+
+### 검증 — 창을 실제로 채우는 20분 세션
+
+위 숫자는 천장 계산이므로, 창을 꽉 채우는 실제 세션으로 확인했습니다. [`scripts/agent-load.py`](scripts/agent-load.py)가 Cline 과 같은 방식으로 API를 두드립니다 — 대화를 키우고, 매 턴 툴 결과를 주입하고, 상한에 닿으면 condense. 20분간:
+
+| | |
+|---|---:|
+| 턴 / condense | 161 / 10 |
+| 최대 프롬프트 | **63,294 토큰** (64K 창을 실제로 채움) |
+| 실패한 턴 | **0** |
+| `memory.peak` | **24.00 GiB** |
+| `memory.events` `max` / `oom_kill` | **0 / 0** |
+| PSI (cgroup·시스템) | 전 구간 0.00 |
+| `MemAvailable` 최저 | 7.86 GB |
+
+```
+23:07:24 cur=20.16G high=3116 anon=4.43G file=15.63G majflt=987  avail=12.09G
+23:11:44 cur=23.01G high=3116 anon=7.28G file=15.63G majflt=996  avail= 9.46G
+23:13:49 cur=23.69G high=3204 anon=8.47G file=15.12G majflt=996  avail= 8.24G   <- 천장 접촉
+23:14:52 cur=24.00G high=3212 anon=8.83G file=15.06G majflt=996  avail= 7.87G
+23:21:19 cur=23.75G high=3229 anon=8.68G file=14.97G majflt=996  avail= 8.05G
+```
+
+옛 상한이었다면 `MemoryHigh=16G`는 23:03에, `MemoryMax=20G`는 23:07에 뚫렸습니다. 이 세션은 OOM 킬로 끝났을 것입니다. 실제로는 백스톱이 한 번도 발동하지 않았습니다.
+
+**다만 24G가 넉넉한 값은 아닙니다.** 64K를 채우는 세션은 대략 24.5GB를 요구하고(모델 15.7GB 위에 anon 8.86GB), 그래서 23:13부터 cgroup이 `MemoryHigh`에 **붙은 채로** 있었고 `high` 카운터가 다시 돌기 시작했습니다 — 8분에 113건, `file`은 15.63GB에서 14.97GB로 깎였습니다.
+
+그래도 괜찮고, 앞선 스톨과의 차이가 바로 요점입니다: `pgmajfault`는 **9** 증가했습니다. 커널이 되돌려 읽을 필요 없는 캐시만 버렸다는 뜻입니다 — 상한이 16G였을 때는 유휴 상태 3분에 3116 이벤트였습니다. `MemoryHigh`가 원래 의도대로 **부드러운 천장**으로 동작했습니다. 32GB 호스트에서 이보다 더 올리면 데스크톱 여유가 5GB 아래로 내려가 같은 고장을 반대편에서 만들게 되므로 24G/26G를 유지합니다. 긴 세션 후반이 느리게 느껴지면 `pressure.log`의 `high` 증가 속도와 `file` 감소를 먼저 보세요 — 이 천장에 닿았다는 신호입니다.
 
 나머지 절반은 스왑입니다. 이 머신엔 스왑이 없었고, 그래서 메모리 압박이 프로세스 종료가 아니라 **라이브락**이 됐습니다. zram 12GB(zstd)는 디스크를 쓰지 않고 이 워크로드가 만드는 anon 페이지를 잘 압축합니다:
 
