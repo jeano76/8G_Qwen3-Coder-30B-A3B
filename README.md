@@ -260,6 +260,13 @@ page cache and re-reading it before it gave up, and during that window the deskt
 and input stopped registering. The machine looked like a hardware fault. It was not: temperatures were
 normal and SMART was clean on both SSDs.
 
+**It froze a second time an hour later.** Same evening, already down to `-c 65536` with the limits and
+zram below in place, the machine locked up again at 22:39 — eight minutes after a restart, with **no**
+OOM kill, no NVRM/Xid error and no hung-task report. The journal stops mid-second and the machine
+needed a hard reset. Nothing in the log names a cause, so this one is recorded as unexplained; the only
+measurable anomaly on the box afterwards was the reclaim treadmill described next, which is why the
+limits were raised rather than left as they were.
+
 **Why the earlier measurements missed it.** The KV cache is not allocated up front. It grows with the
 tokens actually resident, so at a realistic working context all three settings measure the same:
 
@@ -300,8 +307,8 @@ same hardware and prompt. That gain is the llama.cpp build, not this configurati
 
 ```ini
 # scripts/llama-server.service
-MemoryHigh=16G
-MemoryMax=20G
+MemoryHigh=24G                # must exceed the model file; see below
+MemoryMax=26G                 # hard backstop, leaves ~5GB for the desktop
 MemorySwapMax=4G
 Restart=on-failure
 SuccessExitStatus=SIGKILL     # do not restart into the same OOM
@@ -311,6 +318,24 @@ SuccessExitStatus=SIGKILL     # do not restart into the same OOM
 matters just as much: the original unit had `Restart=always`, so systemd restarted the server five
 seconds after the OOM kill and it began reloading a 16GB model into a machine that had just run out of
 memory. The freeze that followed was the second attempt, not the first.
+
+**Choosing the number: the limit has to be bigger than the model file.** The first version of this unit
+used `MemoryHigh=16G`, which is a mistake in the opposite direction. The GGUF is 15.69 GiB, so the
+mmap'd weights alone nearly fill a 16 GiB cgroup and the KV cache, activations and CUDA host buffers
+push it over the moment the server starts. `MemoryHigh` does not kill anything — it throttles the
+cgroup into continuous direct reclaim, and the only reclaimable memory in that cgroup *is the model*:
+
+```
+MemoryHigh    = 16 GiB
+MemoryCurrent = 16.0 GiB          # pinned at the limit
+memory.events:  high 3116         # in three minutes, idle, serving no requests
+memory.stat:    file 16.75GB / anon 0.32GB, pgsteal 3.19M pages
+```
+
+The server evicts its own weights and re-reads them from the SSD, forever. That is a stall that looks
+exactly like the freeze the limit was meant to prevent — and it is self-inflicted, because the host had
+10GB free the whole time. Size `MemoryHigh` above the model plus everything around it and keep
+`MemoryMax` as the hard backstop; on this 32GB machine that is 24G and 26G.
 
 The other half is swap. This machine had none, which is why memory pressure became a livelock instead
 of a kill. 12GB of zram (zstd) costs no disk and compresses the anon pages this workload produces:
@@ -679,6 +704,8 @@ Free swap = 0kB   Total swap = 0kB
 
 **스왑이 0인 32GB 머신에서 이건 깔끔한 프로세스 종료가 아닙니다.** 커널은 포기하기까지 수 분 동안 페이지 캐시를 버리고 다시 읽기를 반복했고(스래싱), 그 사이 데스크톱은 다시 그려지지 않고 입력도 먹지 않았습니다. 겉보기엔 하드웨어 고장 같았지만 아니었습니다 — 온도는 정상이었고 SSD 두 개 모두 SMART는 깨끗했습니다.
 
+**한 시간 뒤 두 번째로 얼어붙었습니다.** 같은 날 저녁, 이미 `-c 65536`으로 내리고 아래의 상한과 zram까지 걸어둔 상태에서 22:39에 다시 멈췄습니다 — 재시작 8분 만이었고, OOM 킬도 NVRM/Xid 오류도 hung task 보고도 **없었습니다.** 저널이 초 단위로 뚝 끊기고 하드 리셋이 필요했습니다. 로그에 원인을 지목하는 항목이 없으므로 이 건은 **원인 미상**으로 기록합니다. 사후에 측정 가능한 유일한 이상은 아래의 회수 treadmill이었고, 그래서 상한을 그대로 두지 않고 올렸습니다.
+
 ### 왜 앞의 측정으로는 못 잡았나
 
 **KV 캐시는 미리 할당되지 않습니다.** 실제로 상주하는 토큰 수에 따라 늘어나므로, 현실적인 작업 컨텍스트에서는 세 설정이 모두 같게 측정됩니다:
@@ -712,14 +739,25 @@ Free swap = 0kB   Total swap = 0kB
 
 ```ini
 # scripts/llama-server.service
-MemoryHigh=16G
-MemoryMax=20G
+MemoryHigh=24G                # 모델 파일보다 커야 한다 — 아래 참고
+MemoryMax=26G                 # 하드 백스톱, 데스크톱 몫 ~5GB를 남긴다
 MemorySwapMax=4G
 Restart=on-failure
 SuccessExitStatus=SIGKILL     # 같은 OOM으로 재시작하지 않는다
 ```
 
 `MemoryMax`는 시스템 전체 프리즈를 **서비스 하나가 죽는 일**로 바꿉니다. `SuccessExitStatus=SIGKILL`도 그만큼 중요합니다 — 원래 유닛은 `Restart=always`였고, 그래서 OOM 킬 5초 뒤 systemd가 서버를 재시작해 **방금 메모리가 바닥난 머신에 16GB 모델을 다시 로드하기 시작했습니다.** 뒤이은 프리즈는 첫 번째가 아니라 두 번째 시도였습니다.
+
+**숫자 고르는 법 — 상한은 모델 파일보다 커야 합니다.** 이 유닛의 첫 버전은 `MemoryHigh=16G`였고, 이건 반대 방향의 실수입니다. GGUF가 15.69 GiB이므로 mmap된 가중치만으로 16 GiB cgroup이 거의 차고, KV 캐시·활성화·CUDA 호스트 버퍼가 얹히는 순간 상한을 넘습니다. `MemoryHigh`는 무엇도 죽이지 않습니다 — cgroup을 **상시 직접 회수(direct reclaim)** 상태로 스로틀링할 뿐이고, 그 cgroup에서 회수 가능한 메모리는 *모델 자신*뿐입니다:
+
+```
+MemoryHigh    = 16 GiB
+MemoryCurrent = 16.0 GiB          # 상한에 붙어 있음
+memory.events:  high 3116         # 3분 동안, 유휴, 요청 처리 없음
+memory.stat:    file 16.75GB / anon 0.32GB, pgsteal 3.19M pages
+```
+
+서버가 자기 가중치를 버렸다가 SSD에서 다시 읽기를 끝없이 반복합니다. 이건 상한이 막으려던 프리즈와 **똑같아 보이는 스톨**이고, 그 내내 호스트에는 10GB가 남아 있었으니 자초한 것입니다. `MemoryHigh`는 모델 + 주변 할당을 모두 담을 만큼 잡고, `MemoryMax`를 하드 백스톱으로 남기세요. 이 32GB 머신에서는 24G / 26G입니다.
 
 나머지 절반은 스왑입니다. 이 머신엔 스왑이 없었고, 그래서 메모리 압박이 프로세스 종료가 아니라 **라이브락**이 됐습니다. zram 12GB(zstd)는 디스크를 쓰지 않고 이 워크로드가 만드는 anon 페이지를 잘 압축합니다:
 
