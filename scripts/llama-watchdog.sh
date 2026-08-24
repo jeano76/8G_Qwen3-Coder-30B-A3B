@@ -23,6 +23,7 @@ PRESSURE_LOG_MAX="${PRESSURE_LOG_MAX:-5242880}"   # 5MB 넘으면 .1 로 회전
 CLINE_PROVIDERS="${CLINE_PROVIDERS:-$HOME/.cline/data/settings/providers.json}"
 DRIFT_FILE="$STATE_DIR/ctx_drift_warned"   # 마지막 불일치 경고 epoch
 DRIFT_QUIET="${DRIFT_QUIET:-3600}"         # 같은 불일치는 1시간에 한 번만 경고
+CTX_RESERVE="${CTX_RESERVE:-8192}"         # 생성용으로 남겨둘 컨텍스트 (실측 최대 1897)
 mkdir -p "$STATE_DIR"
 
 log() { echo "[watchdog] $*"; }
@@ -124,13 +125,28 @@ PY
   set -- $vals; cw=$1; mt=$2
   [ "${cw:-0}" -gt 0 ] 2>/dev/null || return 0
 
+  # providers.json 의 maxTokens 는 실제로 전송되는 값이 아니다. 2026-08-24 실측:
+  # maxTokens 4096 인데 슬롯의 n_predict 는 32000 이었다. 예약해야 할 양은
+  # 설정값이 아니라 서버가 실제로 받은 n_predict 다. 못 읽으면 설정값으로 돌아간다.
+  local npred
+  npred=$(curl -s -m "$PROBE_TIMEOUT" "$ENDPOINT/slots" 2>/dev/null \
+          | python3 -c 'import json,sys; d=json.load(sys.stdin); print(max((s.get("params",{}).get("n_predict",0) or 0) for s in d))' 2>/dev/null || true)
+  if [ -n "${npred:-}" ] && [ "${npred:-0}" -gt 0 ] 2>/dev/null && [ "$npred" -gt "$mt" ]; then
+    mt="$npred"
+  fi
+
+  # 판정 기준은 "선언된 생성 상한"이 아니라 실용 예약분이다. n_predict 는 클라이언트가
+  # 선언한 천장일 뿐이고(2026-08-24 실측 32000), 실제 생성은 중앙값 119 / 최대 1897 이었다.
+  # 32000 을 통째로 예약하면 창의 절반을 버리게 되므로, 여유는 CTX_RESERVE 로 잡고
+  # 선언된 상한은 경고 문구에 근거로만 싣는다.
+  local want=$(( ctx - CTX_RESERVE ))
   msg=""
-  if [ $(( cw + mt )) -gt "$ctx" ]; then
-    msg="Cline contextWindow($cw) + maxTokens($mt) 가 서버 -c ($ctx) 를 넘는다. 대화가 커지면 'exceeds the available context size' 하드 에러가 난다. contextWindow 를 $(( ctx - mt )) 로 맞출 것"
+  if [ "$cw" -gt "$want" ]; then
+    msg="Cline contextWindow($cw) 가 서버 -c ($ctx) 에 너무 붙어 있다(여유 $(( ctx - cw ))토큰). 슬롯에 선언된 생성 상한은 ${mt} 이라 긴 응답 한 번이면 'exceeds the available context size' 로 떨어진다. contextWindow ${want} 권장(예약 ${CTX_RESERVE})"
   else
-    pct=$(( (cw + mt) * 100 / ctx ))
-    if [ "$pct" -lt 75 ]; then
-      msg="Cline contextWindow($cw) + maxTokens($mt) 가 서버 -c ($ctx) 의 ${pct}% 뿐이다. 압축이 불필요하게 자주 돌아 프롬프트 캐시를 버린다. contextWindow $(( ctx - mt )) 권장"
+    pct=$(( cw * 100 / ctx ))
+    if [ "$pct" -lt 70 ]; then
+      msg="Cline contextWindow($cw) 가 서버 -c ($ctx) 의 ${pct}% 뿐이다. 압축이 불필요하게 자주 돌아 프롬프트 캐시를 버린다. contextWindow ${want} 권장"
     fi
   fi
 

@@ -7,7 +7,7 @@ StartLimitIntervalSec=300
 StartLimitBurst=3
 
 [Service]
-ExecStart=%h/llama.cpp/scripts/run-server.sh
+ExecStart=%h/bin/run-server.sh
 
 # 호스트 RAM 상한. 이걸 걸지 않으면 컨텍스트가 가득 찬 세션이
 # 시스템 전체를 OOM으로 몰아 머신이 얼어붙는다(README "호스트 RAM" 절).

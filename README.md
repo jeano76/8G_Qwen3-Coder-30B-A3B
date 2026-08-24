@@ -897,12 +897,17 @@ sudo systemctl start systemd-zram-setup@zram0.service
 ## 상시 구동 (systemd)
 
 ```bash
-mkdir -p ~/.config/systemd/user
+mkdir -p ~/bin ~/.config/systemd/user
+cp scripts/run-server.sh ~/bin/ && chmod +x ~/bin/run-server.sh
 cp scripts/llama-server.service ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now llama-server.service
 loginctl enable-linger $(whoami)   # 로그아웃 후에도 계속 구동
 ```
+
+> 기동 스크립트는 **llama.cpp 작업 트리 밖**(`~/bin/`)에 둡니다. 한동안 `~/llama.cpp/scripts/`에
+> 두고 썼는데, 그 자리는 git 미추적 파일이라 재빌드 전에 `git clean -xdf` 한 번이면 유닛의
+> `ExecStart` 대상이 통째로 사라집니다. 워치독 스크립트도 같은 이유로 `~/bin/`에 둡니다.
 
 OpenAI 호환 API가 `http://127.0.0.1:8080/v1`에서 제공됩니다.
 

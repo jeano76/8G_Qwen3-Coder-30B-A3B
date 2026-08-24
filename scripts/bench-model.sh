@@ -3,6 +3,8 @@
 #
 #   ./scripts/bench-model.sh <model.gguf> <ncmoe> <ub> <ctx> <label> [runs]
 #
+# 환경변수: LLAMA_SERVER (바이너리 경로), EXTRA_ARGS (추가 서버 플래그)
+#
 # 같은 프롬프트(scripts/bench-prompt.txt, 약 22K 토큰)를 cache_prompt:false로
 # 반복 측정하므로 README의 수치와 직접 비교할 수 있다. 측정값은 프롬프트 처리
 # t/s, 긴 컨텍스트 생성 tok/s, 짧은 컨텍스트 생성 tok/s, VRAM.
@@ -11,13 +13,18 @@
 #   systemctl --user stop llama-server
 set -u
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# 빌드 A/B 는 LLAMA_SERVER 로, 플래그 A/B 는 EXTRA_ARGS 로 한다.
+#   LLAMA_SERVER=~/llama.cpp/build-cuda-new/bin/llama-server \
+#   EXTRA_ARGS="--spec-type ngram-mod" ./scripts/bench-model.sh ...
 BIN="${LLAMA_SERVER:-$HOME/llama.cpp/build-cuda/bin/llama-server}"
+EXTRA_ARGS="${EXTRA_ARGS:-}"
 M=$1; NCMOE=$2; UB=$3; CTX=$4; LABEL=$5; RUNS=${6:-3}
 LOG="$(mktemp -t bench-$LABEL-XXXX.log)"
 
+# shellcheck disable=SC2086
 "$BIN" -m "$M" \
   -ngl 99 -ncmoe "$NCMOE" -fa on -t 6 -lm none -np 2 -kvu \
-  -c "$CTX" -ctk q8_0 -ctv q8_0 -ub "$UB" \
+  -c "$CTX" -ctk q8_0 -ctv q8_0 -ub "$UB" $EXTRA_ARGS \
   --host 127.0.0.1 --port 8080 > "$LOG" 2>&1 &
 PID=$!
 
