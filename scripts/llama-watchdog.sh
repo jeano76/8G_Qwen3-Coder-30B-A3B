@@ -23,7 +23,12 @@ PRESSURE_LOG_MAX="${PRESSURE_LOG_MAX:-5242880}"   # 5MB 넘으면 .1 로 회전
 CLINE_PROVIDERS="${CLINE_PROVIDERS:-$HOME/.cline/data/settings/providers.json}"
 DRIFT_FILE="$STATE_DIR/ctx_drift_warned"   # 마지막 불일치 경고 epoch
 DRIFT_QUIET="${DRIFT_QUIET:-3600}"         # 같은 불일치는 1시간에 한 번만 경고
-CTX_RESERVE="${CTX_RESERVE:-8192}"         # 생성용으로 남겨둘 컨텍스트 (실측 최대 1897)
+# 남겨둘 컨텍스트. "생성용 여유"가 아니라 "툴 결과 하나가 더 들어올 자리"다.
+# Cline 의 자동 압축은 턴과 턴 사이에서만 사용률을 보므로, 여유보다 큰 툴 결과
+# 하나가 대화를 서버의 벽 너머로 한 번에 밀어버린다. 317턴 세션에서 측정한 턴 간
+# 증가폭은 46,102 / 34,859 / 17,134 / 16,500 / 14,706 … 이었다.
+# README "자동 압축이 항상 구해주지는 않는 이유" 절.
+CTX_RESERVE="${CTX_RESERVE:-16384}"
 mkdir -p "$STATE_DIR"
 
 log() { echo "[watchdog] $*"; }
@@ -142,7 +147,7 @@ PY
   local want=$(( ctx - CTX_RESERVE ))
   msg=""
   if [ "$cw" -gt "$want" ]; then
-    msg="Cline contextWindow($cw) 가 서버 -c ($ctx) 에 너무 붙어 있다(여유 $(( ctx - cw ))토큰). 슬롯에 선언된 생성 상한은 ${mt} 이라 긴 응답 한 번이면 'exceeds the available context size' 로 떨어진다. contextWindow ${want} 권장(예약 ${CTX_RESERVE})"
+    msg="Cline contextWindow($cw) 가 서버 -c ($ctx) 에 너무 붙어 있다(여유 $(( ctx - cw ))토큰). 슬롯에 선언된 생성 상한은 ${mt} 이고, 그보다 큰 툴 결과 한 번이면 'exceeds the available context size' 로 떨어진다. contextWindow ${want} 권장(예약 ${CTX_RESERVE})"
   else
     pct=$(( cw * 100 / ctx ))
     if [ "$pct" -lt 70 ]; then

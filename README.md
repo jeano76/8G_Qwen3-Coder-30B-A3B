@@ -538,8 +538,11 @@ Raising `-c` by itself does not fix this — Cline fills whatever it is given (r
 
 Keep `contextWindow` in sync with the server, and **do not compute it from `maxTokens`.** That field is
 not what goes on the wire: with `maxTokens: 4096` set, the server's slot reported `n_predict = 32000`.
-Reserve a realistic slice for generation instead — 8192 here, against a measured median of 119 and a
-maximum of 1,897 generated tokens — so `contextWindow` is `-c` minus 8192 = **57344**.
+Reserve a slice instead — but reserve it for the right thing. A generation-sized reserve (8192, against
+a measured median of 119 and a maximum of 1,897 generated tokens) gives `contextWindow` = `-c` − 8192 =
+57344, and that is what was run here for a month. It is not enough: the reserve has to absorb *one more
+tool result*, not one more answer. See [Why auto-compaction does not always save you](#why-auto-compaction-does-not-always-save-you)
+— the watchdog now reserves **16384** and recommends **49152**.
 
 The cost of getting this wrong is not theoretical. It was `126976`, left over from when `-c` was
 131072, and Cline grew a conversation to 67,992 tokens against a 65,536 window before the server
@@ -548,6 +551,58 @@ Do not set it lower than it has to be either: condensing is what destroys the pr
 needlessly small window costs far more than it saves. The watchdog checks this every 60s.
 
 Note that Cline only sends sampling parameters when they are explicitly configured, so the server-side defaults above are what it actually gets.
+
+### Why auto-compaction does not always save you
+
+Even with `contextWindow` correct, the server still rejected 7 requests over 30 days:
+
+```
+srv send_error: request (65546 tokens) exceeds the available context size (65536 tokens)
+srv send_error: request (67992 tokens) exceeds the available context size (65536 tokens)
+```
+
+Cline logs its compaction decisions, and reading them explains why. `strategy: agentic`, threshold
+**90% of `maxInputTokens`**, and the utilisation it compares is the full wire size — messages plus a
+`requestOverheadTokens` of ~7,749 for the system prompt and tool definitions. 21 compactions were
+logged; **8 of them fired only after utilisation had already passed 100%**:
+
+| Trigger utilisation | Request tokens at compaction |
+|---:|---:|
+| 90.2 – 95.4% (13 events) | 51,733 – 55,892 |
+| 101.9% | 58,413 |
+| 133.2% | 85,242 |
+| 144.4% | 82,794 |
+| 157.3% | 90,204 |
+| 159.5% | 91,441 |
+| 171.6% | 109,828 |
+| 208.0% | 133,135 |
+| **329.9%** | **211,118** |
+
+**Every one of the 7 server errors is followed by a compaction within about a minute.** Cline is not
+failing to compact — it is compacting *reactively, after the wall*, and the request that hit the wall
+is a failed run (`status: failed, iteration 84, eventType: run-failed`).
+
+The reason is arithmetic, not a bug. The 90% trigger fires at 51,610 tokens; the server's wall is
+65,536. That leaves **13,926 tokens of headroom**, and Cline can only check utilisation *between*
+turns. A single tool result larger than the headroom jumps the conversation straight past the wall.
+Measured on a 317-turn session, the largest single-turn context jumps were:
+
+```
+46,102  34,859  17,134  16,500  14,706  13,499  12,903  10,652
+```
+
+**Five of those exceed the 13,926-token headroom on their own.** One `read_file` on a large source
+file is enough.
+
+So the reserve between `contextWindow` and `-c` is not really "room for generation" — it is room for
+*one more tool result*, and it has to be sized against the largest one the agent will produce, not
+against `n_predict`. Covering a 17K jump needs `contextWindow ≤ 53,780`; covering the 34,859 outlier
+would need ≤ 34,085, which halves the working context and is not worth it. **49152** is the balance
+point: it covers 7 of the 8 measured jumps with 21,299 tokens of headroom, at the cost of compacting
+somewhat more often.
+
+There is no server-side fix. `-c` cannot rise — [Host RAM](#host-ram-the-failure-mode-vram-numbers-do-not-predict)
+shows the ceiling is already binding — and the server cannot clamp what a client sends.
 
 ## Speculative decoding: MTP pays, ngram-mod is unproven
 
@@ -1278,7 +1333,7 @@ Cline CLI를 쓴다면 `~/.cline/data/settings/providers.json`:
 
 수정 후 Cline을 완전히 종료했다 재실행해야 반영됩니다(실행 중이면 종료 시 덮어씁니다).
 
-`contextWindow`는 서버 `-c`에 맞추되, **`maxTokens`에서 빼서 계산하지 마세요.** 그 필드는 실제로 전송되는 값이 아닙니다 — `maxTokens: 4096`을 넣어둔 상태에서 서버 슬롯이 보고한 `n_predict`는 **32000**이었습니다. 대신 생성용으로 현실적인 몫을 예약하세요. 실측 생성 길이가 중앙값 119 / 최대 1,897 토큰이므로 8192면 충분하고, `contextWindow`는 `-c` − 8192 = **`57344`** 입니다.
+`contextWindow`는 서버 `-c`에 맞추되, **`maxTokens`에서 빼서 계산하지 마세요.** 그 필드는 실제로 전송되는 값이 아닙니다 — `maxTokens: 4096`을 넣어둔 상태에서 서버 슬롯이 보고한 `n_predict`는 **32000**이었습니다. 대신 몫을 예약하되, **무엇을 위한 예약인지**를 맞춰야 합니다. 생성 길이 기준으로 잡으면(실측 중앙값 119 / 최대 1,897 토큰) 8192면 충분하고 `contextWindow`는 `-c` − 8192 = `57344`가 되며, 실제로 한 달간 그렇게 운용했습니다. 그런데 부족합니다 — 예약분이 흡수해야 하는 것은 답변 하나가 아니라 **툴 결과 하나**입니다. [자동 압축이 항상 구해주지는 않는 이유](#자동-압축이-항상-구해주지는-않는-이유) 절 참고. 워치독은 이제 **16384**를 예약하고 **49152**를 권장합니다.
 
 이걸 틀렸을 때의 대가는 이론이 아닙니다. `-c`가 131072이던 시절 값 `126976`이 그대로 남아 있었고, Cline이 65,536 창에 67,992 토큰짜리 대화를 밀어 넣어 서버가 하드 에러를 냈습니다. `61440`으로 고친 뒤에도 세션이 **65,207 토큰까지 갔습니다 — 벽에서 329 토큰 남은 값입니다.** 그렇다고 필요 이상으로 작게 잡지도 마세요 — 압축이 프롬프트 캐시를 파괴하므로 작은 윈도우는 아끼는 것보다 훨씬 큰 비용을 물립니다. 워치독이 이 값을 60초마다 검사합니다.
 
@@ -1290,6 +1345,43 @@ Cline CLI를 쓴다면 `~/.cline/data/settings/providers.json`:
 | 49152 | 34 | 43.6 | −4% |
 | 65536 | 38 | 41.3 | −9% |
 | 73728 (한계) | 40 | 40.3 | −11% |
+
+### 자동 압축이 항상 구해주지는 않는 이유
+
+`contextWindow`를 제대로 맞춘 뒤에도 30일 동안 서버가 요청 7건을 거절했습니다:
+
+```
+srv send_error: request (65546 tokens) exceeds the available context size (65536 tokens)
+srv send_error: request (67992 tokens) exceeds the available context size (65536 tokens)
+```
+
+Cline은 압축 판단을 로그로 남기고, 그걸 읽으면 이유가 나옵니다. `strategy: agentic`, 임계값은 **`maxInputTokens`의 90%**, 그리고 비교 대상인 사용률은 실제 전송 크기입니다 — 메시지 + 시스템 프롬프트·툴 정의에 해당하는 `requestOverheadTokens` 약 7,749. 기록된 압축 21회 중 **8회는 사용률이 이미 100%를 넘은 뒤에야 발동했습니다**:
+
+| 발동 시점 사용률 | 그때의 요청 토큰 |
+|---:|---:|
+| 90.2 ~ 95.4% (13회) | 51,733 ~ 55,892 |
+| 101.9% | 58,413 |
+| 133.2% | 85,242 |
+| 144.4% | 82,794 |
+| 157.3% | 90,204 |
+| 159.5% | 91,441 |
+| 171.6% | 109,828 |
+| 208.0% | 133,135 |
+| **329.9%** | **211,118** |
+
+**서버 에러 7건 모두 1분 안에 압축이 뒤따릅니다.** Cline이 압축을 못 하는 게 아니라, **벽에 부딪힌 뒤에 사후적으로** 압축합니다. 그리고 벽에 부딪힌 그 요청은 실패한 실행입니다(`status: failed, iteration 84, eventType: run-failed`).
+
+원인은 버그가 아니라 산수입니다. 90% 임계는 51,610토큰에서 걸리고 서버의 벽은 65,536입니다. 남는 여유가 **13,926토큰**인데, Cline은 사용률을 턴과 턴 *사이*에서만 확인할 수 있습니다. 여유보다 큰 툴 결과 하나가 대화를 벽 너머로 한 번에 밀어버립니다. 317턴 세션에서 측정한 턴 간 컨텍스트 증가폭 상위값은 이렇습니다:
+
+```
+46,102  34,859  17,134  16,500  14,706  13,499  12,903  10,652
+```
+
+**이 중 다섯 개가 13,926 여유를 혼자 넘깁니다.** 큰 소스 파일 하나를 `read_file` 하면 그걸로 끝입니다.
+
+그러니 `contextWindow`와 `-c` 사이의 예약분은 사실 "생성용 여유"가 아닙니다 — **툴 결과 하나가 더 들어올 자리**이고, `n_predict`가 아니라 에이전트가 만들어낼 가장 큰 툴 결과에 맞춰 잡아야 합니다. 17K 증가폭을 감당하려면 `contextWindow ≤ 53,780`이 필요하고, 34,859짜리 이상치까지 덮으려면 ≤ 34,085이 되어 작업 컨텍스트가 반토막 납니다 — 그건 수지가 안 맞습니다. **49152**가 균형점입니다. 측정된 증가폭 8개 중 7개를 21,299토큰의 여유로 덮으면서, 대가는 압축이 다소 잦아지는 것뿐입니다.
+
+서버 쪽 해결책은 없습니다. `-c`는 못 올리고([호스트 RAM](#호스트-ram--vram-수치가-예측해주지-않는-고장) 절에서 천장이 이미 빡빡합니다), 서버는 클라이언트가 보내는 것을 깎을 수 없습니다.
 
 ### 프롬프트 캐시 동작 — 느려지는 진짜 지점
 
