@@ -4,7 +4,7 @@
 
 Measured notes and the running configuration for a 30B-class coding LLM at usable speed on a single 8GB GPU. Every number below was measured on the machine described here — including the approaches that turned out to be slower. The work started on Qwen3-Coder-30B-A3B; the current configuration runs Qwen3.6-35B-A3B, and both are documented.
 
-**Result: a 35B-parameter model with a 64K context on a GPU that holds neither** — 44.7 tok/s generation and 928 t/s prompt processing at a real 22K-token Cline working context, up from 21.1 tok/s on the model this document started with. The last 17.7% of that generation figure comes from MTP, and stacking `ngram-mod` on top adds a further 17.9% on agent-shaped traffic — both measured in [Speculative decoding](#speculative-decoding-mtp-pays-and-so-does-ngram-mod).
+**Result: a 35B-parameter model with a 64K context on a GPU that holds neither** — 44.7 tok/s generation and 928 t/s prompt processing at a real 22K-token Cline working context, up from 21.1 tok/s on the model this document started with. The last 17.7% of that generation figure comes from MTP, measured in [Speculative decoding](#speculative-decoding-mtp-pays-ngram-mod-is-unproven). `ngram-mod` is stacked on top of it and costs nothing, but its gain is unproven — the section explains how a benchmark artifact nearly got it recorded as +17.9%.
 
 The context was 128K until a session that actually filled it exhausted host RAM and froze the machine. That is documented in [Host RAM](#host-ram-the-failure-mode-vram-numbers-do-not-predict), along with the measurement that shows 64K costs nothing to give up.
 
@@ -54,8 +54,8 @@ sampling values differ.
 
 | Flag | Why |
 |---|---|
-| `-ncmoe 35` | Keep 35 of 40 layers' expert weights on the CPU. MTP needs more VRAM than the plain model: 33 loads but dies mid-inference, and 35 measured faster than 34 — see [Speculative decoding](#speculative-decoding-mtp-pays-and-so-does-ngram-mod) |
-| `--spec-type draft-mtp,ngram-mod --spec-draft-n-max 2` | Two speculators stacked. MTP is **+17.7% generation** against the same file with MTP off, and `ngram-mod` on top of it is a further **+17.9%** on an agent-shaped load. MTP requires the `-MTP-` GGUF build of the model |
+| `-ncmoe 35` | Keep 35 of 40 layers' expert weights on the CPU. MTP needs more VRAM than the plain model: 33 loads but dies mid-inference, and 35 measured faster than 34 — see [Speculative decoding](#speculative-decoding-mtp-pays-ngram-mod-is-unproven) |
+| `--spec-type draft-mtp,ngram-mod --spec-draft-n-max 2` | Two speculators stacked. MTP is **+17.7% generation** against the same file with MTP off, and requires the `-MTP-` GGUF build of the model. `ngram-mod` rides along: it costs nothing measurable and wins big when the model emits text verbatim from its context, but no measurement here establishes a general gain |
 | `-c 65536` | Puts Cline's condense threshold at 61K — still far above the 28.3K that observed sessions actually reach, so prompt-cache rebuilds stop happening. Was 131072 until a full 128K context OOM'd the host; see [Host RAM](#host-ram-the-failure-mode-vram-numbers-do-not-predict) |
 | `-sps 0.5` | Slot-prompt similarity floor. The default of 0.10 lets a barely-related prompt claim a slot holding a 60K cache and destroy it |
 | `-rea off` | Disable thinking. Thought tokens are latency on every single tool call in an agent loop |
@@ -501,7 +501,7 @@ needlessly small window costs far more than it saves. The watchdog checks this e
 
 Note that Cline only sends sampling parameters when they are explicitly configured, so the server-side defaults above are what it actually gets.
 
-## Speculative decoding: MTP pays, and so does ngram-mod
+## Speculative decoding: MTP pays, ngram-mod is unproven
 
 Three ideas were measured against the running configuration on the same fixed 21,525-token prompt,
 median of 3 (`scripts/bench-model.sh`, binary selected with `LLAMA_SERVER`, flags with `EXTRA_ARGS`).
@@ -521,8 +521,9 @@ again — the earlier build update that gave +16% was a different range of commi
 `ngram-cache` costs **13.5% of generation**; reject it. `ngram-mod` leaves the median untouched, but
 one run of the three hit 74.55 tok/s — 1.9x. That is how speculation behaves: a hit wins big, a miss
 costs nothing. Three repetitions of one fixed prompt crush that variance into the median, so this
-benchmark cannot settle it. Settling it took an agent-shaped load, which is
-[below](#stacking-ngram-mod-on-mtp) — the answer turned out to be yes.
+benchmark cannot settle it. An agent-shaped load was supposed to settle it
+[below](#stacking-ngram-mod-on-mtp-and-the-artifact-that-nearly-got-published). It did not, but it did
+produce a lesson worth more than the answer.
 
 **MTP.** This needs a different file — the `-MTP-` GGUF (16.04 GB, 753 tensors against 733; the extra
 20 are the MTP head). The control row is that same file at the same `-ncmoe` with MTP switched off, so
@@ -548,7 +549,7 @@ gives back most of the generation while collapsing short-context generation to 3
 not merely the largest that fits.
 
 
-### Stacking ngram-mod on MTP
+### Stacking ngram-mod on MTP, and the artifact that nearly got published
 
 The fixed-prompt bench could not settle `ngram-mod`, and reading the source raised a specific worry:
 `common/speculative.cpp` registers speculators in priority order ("the one with highest priority are
@@ -563,24 +564,58 @@ prompt tokens (224,293 against 224,621), so the context trajectories match.
 
 | | `draft-mtp` | `draft-mtp,ngram-mod` |
 |---|---:|---:|
-| Generation, aggregate | 4,635 tok / 121.6s = **38.12 tok/s** | 4,972 tok / 110.6s = **44.96 tok/s** |
-| Per-request median | 37.99 tok/s | 40.10 tok/s |
-| Per-request mean | 38.81 tok/s | **48.91 tok/s** |
+| Generation, aggregate | 4,635 tok / 121.6s = 38.12 tok/s | 4,972 tok / 110.6s = **44.96 tok/s** |
 | Draft acceptance | 2,642 / 3,978 = 0.664 | 3,557 / 4,691 = **0.758** |
 | Mean draft length | 2.38 | **6.73** |
 | Prompt processing | 619 t/s | 612 t/s |
 
-**The worry was wrong, in the useful direction.** Acceptance went *up*, 0.664 → 0.758, and mean draft
-length nearly tripled — `ngram-mod` is not bound by `--spec-draft-n-max 2` the way the MTP head is, so
-when it hits it hits long. Generation is **+17.9%** for prompt processing that does not move (−1.1%,
-inside noise). Adopted.
+That reads as **+17.9% generation for no cost**, and it was written into this document as exactly
+that. It is wrong.
 
-Two limits on that number, both visible in the table. The gap between the median (+5.6%) and the mean
-(+26%) *is* the result: n-gram wins are uncommon and enormous, so a typical request gains much less
-than the average suggests. And 60 turns took 489s against 483s — this driver spends 75–77% of wall
-clock on prompt processing, so an 18% generation gain is worth only ~4% end-to-end *here*. A real
-Cline hour spends 72% of wall clock generating, where the same 18% is worth far more. The driver also
-replays one corpus, which flatters n-gram lookup more than varied traffic would.
+**The tell was in the log.** The per-request `draft acceptance` lines repeated *identical* values —
+`96 accepted / 112 generated, mean len = 14.71`, ten times in a row. Per-request stats cannot repeat
+by chance (`server-context.cpp` clears `stats` in `reset()` on every slot release, so each line is one
+request). Lining the journal up against the driver's own turn log explained it:
+
+```
+draft-mtp        gen: 83 95 90 64 … 96 60 72 [60 ×12]
+draft-mtp,ngram  gen: [102 ×12] 120 60 45 … [81 ×12] 120 65 74 …
+```
+
+**The model falls into emitting the same answer verbatim, turn after turn.** That is the driver's
+fault — it replays one corpus, and a summarize-this task over near-identical context converges on a
+fixed answer. The MTP arm spent 12 of 60 turns in such a run; the n-gram arm spent **24**. Verbatim
+repetition is the one thing an n-gram speculator predicts for free: 12 of those requests hit
+acceptance 1.000, and the `102 ×12` run drafted at mean length 14.71.
+
+Drop the repeated-output runs from both arms and the result changes completely:
+
+| | All 60 turns | Repeat runs excluded |
+|---|---:|---:|
+| `draft-mtp` | 38.12 tok/s | **36.78** (48 turns) |
+| `draft-mtp,ngram-mod` | 44.96 tok/s | **37.42** (36 turns) |
+| Difference | +17.9% | **+1.7%** |
+
+**+1.7% is noise. The entire gain came from the degenerate runs.** A symmetric cut — drop every
+request with acceptance ≥ 0.9 — gives 36.29 against 40.47, +11.5%; but that rule misses the `102 ×12`
+run, which repeats verbatim at acceptance 0.857. The artifact is *output repetition*, so the cut has
+to be on repetition, and that answer is +1.7%.
+
+Three things are worth keeping from this.
+
+**The original worry was still disproven.** Acceptance rose rather than fell, 0.664 → 0.758, and mean
+draft length nearly tripled — `ngram-mod` is not bound by `--spec-draft-n-max 2` the way the MTP head
+is. Whatever else is true, n-gram does not pre-empt MTP into being worse.
+
+**`ngram-mod` stays enabled, on no-harm grounds rather than measured gain.** Prompt processing is
+unchanged (−1.1%, inside noise), the fixed-prompt bench put its VRAM cost at 17 MiB, and it wins large
+whenever the model quotes its context back verbatim — which real agent work does constantly, in diffs
+and file rewrites. What is unproven is a *general* speedup, and this document does not claim one.
+
+**A synthetic driver has to be checked for degeneracy before its numbers are believed.** Aggregate
+throughput hid this completely; only the per-request distribution showed it. `scripts/agent-load.py`
+grows realistic context but does not produce realistic *output*, and speculative decoding is precisely
+the feature that cares about the difference.
 
 > **Host RAM.** `-ncmoe 35` puts two more layers of experts in system RAM and the file is 0.35 GB
 > larger, so peak host RSS runs above the 24.00 GiB measured for the old configuration against
@@ -722,8 +757,8 @@ Full measurement logs, per-flag reasoning, and the complete benchmark appendix a
 
 체크인된 [`scripts/run-server.sh`](scripts/run-server.sh)가 이 설정입니다. 아래 "2026년 8월 기준 모델 지형"의 A/B 실측에서 동일 VRAM으로 **생성 +72%, 프롬프트 처리 +16%, 컨텍스트 2배**가 확인되어 Qwen3-Coder-30B-A3B 설정을 대체했습니다.
 
-- `-ncmoe 35`: 40개 레이어 중 35개의 전문가 가중치를 CPU에. MTP는 일반 모델보다 VRAM을 더 먹어서 33은 로드는 되지만 추론 중에 죽고, 34보다 35가 더 빨랐습니다([투기적 디코딩](#투기적-디코딩--mtp도-ngram-mod도-값을-한다) 절)
-- **`--spec-type draft-mtp,ngram-mod --spec-draft-n-max 2`**: 투기 디코딩 둘을 겹칩니다. MTP는 같은 파일에서 MTP만 끈 대조군 대비 **생성 +17.7%**이고, 그 위에 얹은 `ngram-mod`가 에이전트형 부하에서 **추가 +17.9%**입니다. MTP는 모델의 `-MTP-` GGUF 빌드가 필요합니다
+- `-ncmoe 35`: 40개 레이어 중 35개의 전문가 가중치를 CPU에. MTP는 일반 모델보다 VRAM을 더 먹어서 33은 로드는 되지만 추론 중에 죽고, 34보다 35가 더 빨랐습니다([투기적 디코딩](#투기적-디코딩--mtp는-값을-하고-ngram-mod는-미결이다) 절)
+- **`--spec-type draft-mtp,ngram-mod --spec-draft-n-max 2`**: 투기 디코딩 둘을 겹칩니다. MTP는 같은 파일에서 MTP만 끈 대조군 대비 **생성 +17.7%**이고, 모델의 `-MTP-` GGUF 빌드가 필요합니다. `ngram-mod`는 얹어만 둔 상태입니다 — 측정 가능한 비용이 없고 모델이 컨텍스트의 문장을 축자로 뱉을 때 크게 이기지만, 일반적인 이득을 입증한 측정은 여기 없습니다
 - `-c 65536`: Cline 압축 임계를 61k에 놓습니다. 실측 세션이 실제로 도달하는 28.3k보다 한참 위라 캐시 재구축이 일어나지 않습니다. 131072를 쓰다가 128k를 실제로 채운 세션이 호스트를 OOM으로 몰아 낮췄습니다([호스트 RAM](#호스트-ram--vram-수치가-예측해주지-않는-고장) 절)
 - **`-sps 0.5`**: 슬롯 재사용 최소 유사도. 기본값 0.10은 거의 무관한 프롬프트가 6만 토큰 캐시를 들고 있는 슬롯을 차지해 파괴하도록 허용합니다(아래 절 참고)
 - `-rea off`: thinking 차단. 에이전트 루프에서는 사고 토큰이 매 툴 콜마다 지연으로 쌓입니다
@@ -1359,7 +1394,7 @@ Cline의 압축처럼 요약문이 **삽입**되는 변형은 원리적으로 �
 
 > 7B가 raw 속도는 가장 빠르지만 버그 발생률 때문에 채택하지 않았습니다. 자세한 내용은 위 "모델 비교 벤치마크"와 "왜 MoE인가" 참고.
 
-## 투기적 디코딩 — MTP도 ngram-mod도 값을 한다
+## 투기적 디코딩 — MTP는 값을 하고, ngram-mod는 미결이다
 
 세 가지를 현재 설정 대비로 측정했습니다. 같은 고정 프롬프트(21,525토큰), 각 3회 중앙값 (`scripts/bench-model.sh`, 바이너리는 `LLAMA_SERVER`로, 플래그는 `EXTRA_ARGS`로 지정).
 
@@ -1374,7 +1409,7 @@ Cline의 압축처럼 요약문이 **삽입**되는 변형은 원리적으로 �
 
 **재빌드는 아무것도 주지 않았습니다.** 모든 수치가 측정 편차 안입니다. 다시 시도하지 않도록 기록해 둡니다 — 앞서 +16%를 준 빌드 갱신은 다른 커밋 구간이었습니다.
 
-`ngram-cache`는 **생성을 13.5% 깎습니다.** 기각입니다. `ngram-mod`는 중앙값이 그대로인데 3회 중 1회가 74.55 tok/s로 **1.9배**였습니다. 투기 디코딩은 원래 이렇게 동작합니다 — 맞으면 크게 이기고 빗나가면 본전입니다. 고정 프롬프트 3회 반복은 그 분산을 중앙값으로 눌러버리므로 이 벤치로는 판정이 안 됩니다. 판정에는 에이전트형 부하가 필요했고, [아래](#mtp-위에-ngram-mod-겹치기)에 있습니다 — 결론은 이득이 맞습니다.
+`ngram-cache`는 **생성을 13.5% 깎습니다.** 기각입니다. `ngram-mod`는 중앙값이 그대로인데 3회 중 1회가 74.55 tok/s로 **1.9배**였습니다. 투기 디코딩은 원래 이렇게 동작합니다 — 맞으면 크게 이기고 빗나가면 본전입니다. 고정 프롬프트 3회 반복은 그 분산을 중앙값으로 눌러버리므로 이 벤치로는 판정이 안 됩니다. 에이전트형 부하로 판정하려 했고 그 시도가 [아래](#mtp-위에-ngram-mod-겹치기--하마터면-발행할-뻔한-아티팩트)에 있습니다. 판정은 실패했지만, 답보다 값진 교훈이 하나 남았습니다.
 
 **MTP.** 파일이 다릅니다 — `-MTP-` GGUF(16.04 GB, 텐서 753개 대 733개, 늘어난 20개가 MTP 헤드). 대조군은 **같은 파일, 같은 `-ncmoe`에서 MTP만 끈 값**이라, 비교가 다운로드가 아니라 기능 자체를 분리합니다:
 
@@ -1393,7 +1428,7 @@ Cline의 압축처럼 요약문이 **삽입**되는 변형은 원리적으로 �
 로드 시점 VRAM 수치로는 안 보이는 것이 표에 둘 있습니다. `-ncmoe 33`은 7,699 MiB로 **로드까지는 되고** 추론 중에 죽습니다 — MTP의 드래프트 경로가 요구하는 여유는 실행해야 드러납니다. 그리고 36은 생성을 거의 돌려주면서 짧은 컨텍스트 생성을 35.6으로 무너뜨립니다. 35는 "들어가는 최대값"이 아니라 **최적값**입니다.
 
 
-### MTP 위에 ngram-mod 겹치기
+### MTP 위에 ngram-mod 겹치기 — 하마터면 발행할 뻔한 아티팩트
 
 고정 프롬프트 벤치로는 `ngram-mod`를 판정할 수 없었고, 소스를 읽으니 구체적인 걱정거리가 하나
 나왔습니다. `common/speculative.cpp`는 투기 디코더를 **우선순위 순서로** 등록하는데("the one with
@@ -1408,24 +1443,56 @@ highest priority are listed first"), 모든 `ngram-*` 타입이 `draft-mtp`보�
 
 | | `draft-mtp` | `draft-mtp,ngram-mod` |
 |---|---:|---:|
-| 생성, 합계 | 4,635 tok / 121.6초 = **38.12 tok/s** | 4,972 tok / 110.6초 = **44.96 tok/s** |
-| 요청별 중앙값 | 37.99 tok/s | 40.10 tok/s |
-| 요청별 평균 | 38.81 tok/s | **48.91 tok/s** |
+| 생성, 합계 | 4,635 tok / 121.6초 = 38.12 tok/s | 4,972 tok / 110.6초 = **44.96 tok/s** |
 | 드래프트 수락률 | 2,642 / 3,978 = 0.664 | 3,557 / 4,691 = **0.758** |
 | 평균 드래프트 길이 | 2.38 | **6.73** |
 | 프롬프트 처리 | 619 t/s | 612 t/s |
 
-**걱정은 틀렸고, 쓸모 있는 방향으로 틀렸습니다.** 수락률이 오히려 **올랐고**(0.664 → 0.758) 평균
-드래프트 길이는 거의 3배가 됐습니다 — `ngram-mod`는 MTP 헤드와 달리 `--spec-draft-n-max 2`에 묶이지
-않아서, 맞을 때 길게 맞습니다. 프롬프트 처리는 그대로인 채(−1.1%, 편차 안) **생성 +17.9%**입니다.
-채택합니다.
+**공짜로 생성 +17.9%**로 읽히고, 실제로 그렇게 이 문서에 적혔습니다. 틀렸습니다.
 
-이 수치에 붙는 한계 둘도 표에 그대로 보입니다. 중앙값(+5.6%)과 평균(+26%)의 격차가 곧 결과입니다 —
-n-gram의 적중은 드물고 대신 크기 때문에, 평범한 요청 하나가 얻는 이득은 평균이 시사하는 것보다 훨씬
-작습니다. 그리고 60턴에 489초 대 483초였습니다. 이 드라이버는 벽시계의 75~77%를 프롬프트 처리에
-쓰므로, 생성 18%는 **여기서는** 전체의 4% 정도밖에 안 됩니다. 실제 Cline 1시간은 벽시계의 72%를
-생성에 쓰고, 거기서는 같은 18%가 훨씬 큽니다. 드라이버가 코퍼스 하나를 반복 재생한다는 점도
-다양한 실트래픽보다 n-gram 조회에 유리하게 작용합니다.
+**단서는 로그에 있었습니다.** 요청별 `draft acceptance` 줄에 *똑같은 값*이 반복됐습니다 —
+`96 accepted / 112 generated, mean len = 14.71`이 연속 10번. 요청별 통계가 우연히 같을 수는
+없습니다(`server-context.cpp`는 슬롯이 릴리스될 때마다 `reset()`에서 `stats = {}`를 하므로 한 줄이
+곧 한 요청입니다). 저널을 드라이버의 턴 로그와 맞춰보니 답이 나왔습니다:
+
+```
+draft-mtp        gen: 83 95 90 64 … 96 60 72 [60 ×12]
+draft-mtp,ngram  gen: [102 ×12] 120 60 45 … [81 ×12] 120 65 74 …
+```
+
+**모델이 턴마다 같은 답을 글자 그대로 뱉는 구간에 빠집니다.** 드라이버 탓입니다 — 코퍼스 하나를
+반복 재생하는데, 거의 같은 컨텍스트에 대한 "요약하라" 과제는 고정된 답으로 수렴합니다. MTP 조건은
+60턴 중 12턴이 이 구간이었고, n-gram 조건은 **24턴**이었습니다. 축자 반복은 n-gram 투기 디코더가
+공짜로 맞히는 바로 그것입니다 — 그중 12건이 수락률 1.000이었고, `102 ×12` 구간은 평균 드래프트
+길이 14.71로 드래프트했습니다.
+
+양쪽에서 반복 구간을 빼면 결과가 완전히 달라집니다:
+
+| | 전체 60턴 | 반복 구간 제외 |
+|---|---:|---:|
+| `draft-mtp` | 38.12 tok/s | **36.78** (48턴) |
+| `draft-mtp,ngram-mod` | 44.96 tok/s | **37.42** (36턴) |
+| 차이 | +17.9% | **+1.7%** |
+
+**+1.7%는 편차입니다. 이득 전부가 퇴화 구간에서 나왔습니다.** 대칭 기준으로 수락률 0.9 이상을
+전부 빼면 36.29 대 40.47로 +11.5%가 나오지만, 이 규칙은 수락률 0.857로 축자 반복하던 `102 ×12`
+구간을 놓칩니다. 아티팩트의 정체가 *출력 반복*이므로 잘라내는 기준도 반복이어야 하고, 그 답이
++1.7%입니다.
+
+여기서 남길 것이 셋 있습니다.
+
+**원래의 걱정은 그래도 기각됐습니다.** 수락률은 떨어지기는커녕 0.664 → 0.758로 올랐고 평균 드래프트
+길이는 거의 3배가 됐습니다 — `ngram-mod`는 MTP 헤드와 달리 `--spec-draft-n-max 2`에 묶이지 않기
+때문입니다. 다른 건 몰라도, n-gram이 MTP를 밀어내 더 나쁘게 만들지는 않습니다.
+
+**`ngram-mod`는 켜 둡니다. 측정된 이득이 아니라 무해함이 근거입니다.** 프롬프트 처리는 그대로이고
+(−1.1%, 편차 안), 고정 프롬프트 벤치에서 VRAM 비용은 17 MiB였으며, 모델이 컨텍스트를 축자로 인용할
+때는 크게 이깁니다 — 실제 에이전트 작업은 diff와 파일 재작성에서 그걸 끊임없이 합니다. 입증되지
+않은 것은 *일반적인* 속도 향상이고, 이 문서는 그걸 주장하지 않습니다.
+
+**합성 드라이버는 수치를 믿기 전에 퇴화 여부부터 확인해야 합니다.** 합계 처리량은 이 문제를 완전히
+가렸고, 요청별 분포만이 드러냈습니다. `scripts/agent-load.py`는 현실적인 컨텍스트를 만들지만 현실적인
+*출력*을 만들지는 않는데, 투기 디코딩은 하필 그 차이에 민감한 기능입니다.
 
 > **호스트 RAM.** `-ncmoe 35`는 익스퍼트 두 레이어를 시스템 RAM으로 더 내리고 파일도 0.35 GB 큽니다. 따라서 호스트 RSS 피크가 옛 설정에서 측정한 24.00 GiB(상한 `MemoryHigh=24G`)보다 위로 올라갑니다. 그래서 나중에 측정하고 상한을 25G로 올렸습니다 — [MTP가 천장에 한 일](#mtp가-천장에-한-일) 절 참고.
 
