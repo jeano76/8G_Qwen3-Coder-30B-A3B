@@ -531,7 +531,7 @@ Raising `-c` by itself does not fix this — Cline fills whatever it is given (r
   "baseUrl": "http://127.0.0.1:8080/v1",
   "apiKey": "sk-no-key-required",
   "model": "Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf",
-  "contextWindow": 57344,
+  "contextWindow": 49152,
   "maxTokens": 4096
 }
 ```
@@ -866,7 +866,7 @@ Full measurement logs, per-flag reasoning, and the complete benchmark appendix a
 - **`-sps 0.5`**: 슬롯 재사용 최소 유사도. 기본값 0.10은 거의 무관한 프롬프트가 6만 토큰 캐시를 들고 있는 슬롯을 차지해 파괴하도록 허용합니다(아래 절 참고)
 - `-rea off`: thinking 차단. 에이전트 루프에서는 사고 토큰이 매 툴 콜마다 지연으로 쌓입니다
 - 샘플링 `--temp 1.0 --top-p 0.95 --top-k 20`: GGUF 메타데이터의 모델 권장값입니다. Qwen3-Coder용 0.7 / 0.8 / 1.05가 **아닙니다**
-- cline `contextWindow`는 **57344**(= 65536 − 생성 예약 8192)
+- cline `contextWindow`는 **49152**(= 65536 − 예약 16384). 예약분은 생성용이 아니라 툴 결과 하나가 더 들어올 자리입니다
 
 `-ub 2048`, `-kvu`, `-lm none`, `-t 6`, KV 캐시 `q8_0` 등 이 문서가 확립한 나머지 결론은 그대로 유효합니다 — 모델과 `-ncmoe`, `-c`, `-np`, 샘플링 값만 달라집니다.
 
@@ -1285,7 +1285,7 @@ models:
     model: Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf
     apiBase: http://127.0.0.1:8080/v1
     apiKey: none
-    contextLength: 57344
+    contextLength: 49152
     capabilities:
       - tool_use   # 빠뜨리면 Continue.dev가 파일 읽기 등 에이전트/툴 기능을 아예 시도하지 않음
     roles:
@@ -1323,7 +1323,7 @@ Cline CLI를 쓴다면 `~/.cline/data/settings/providers.json`:
         "apiKey": "sk-no-key-required",
         "model": "Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf",
         "baseUrl": "http://127.0.0.1:8080/v1",
-        "contextWindow": 57344,
+        "contextWindow": 49152,
         "maxTokens": 4096
       }
     }
