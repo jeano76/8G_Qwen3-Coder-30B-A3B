@@ -14,9 +14,9 @@
 set -u
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # 빌드 A/B 는 LLAMA_SERVER 로, 플래그 A/B 는 EXTRA_ARGS 로 한다.
-#   LLAMA_SERVER=~/llama.cpp/build-cuda-new/bin/llama-server \
+#   LLAMA_SERVER=~/llama.cpp/build-cuda-old/bin/llama-server \
 #   EXTRA_ARGS="--spec-type ngram-mod" ./scripts/bench-model.sh ...
-BIN="${LLAMA_SERVER:-$HOME/llama.cpp/build-cuda/bin/llama-server}"
+BIN="${LLAMA_SERVER:-$HOME/llama.cpp/build-cuda-new/bin/llama-server}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 M=$1; NCMOE=$2; UB=$3; CTX=$4; LABEL=$5; RUNS=${6:-3}
 LOG="$(mktemp -t bench-$LABEL-XXXX.log)"
