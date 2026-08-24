@@ -11,6 +11,6 @@ exec ~/llama.cpp/build-cuda-new/bin/llama-server \
   -c 65536 -ctk q8_0 -ctv q8_0 \
   -sps 0.5 \
   -rea off \
-  --spec-type draft-mtp --spec-draft-n-max 2 \
+  --spec-type draft-mtp,ngram-mod --spec-draft-n-max 2 \
   --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 \
   --host 127.0.0.1 --port 8080
