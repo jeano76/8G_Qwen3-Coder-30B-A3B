@@ -7,7 +7,7 @@
 # 'error while loading shared libraries' 로 즉시 죽는다. 옮기려면 재빌드해야 한다.
 exec ~/llama.cpp/build-cuda-new/bin/llama-server \
   -m ~/models/Qwen3.6-35B-A3B-MTP-UD-Q3_K_XL.gguf \
-  -ngl 99 -ncmoe 35 -fa on -t 6 -lm none -np 2 -kvu -ub 2048 \
+  -ngl 99 -ncmoe 35 -fa on -t 6 -lm none -np 1 -kvu -ub 2048 \
   -c 65536 -ctk q8_0 -ctv q8_0 \
   -sps 0.5 \
   -rea off \

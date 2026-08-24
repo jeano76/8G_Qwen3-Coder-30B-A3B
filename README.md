@@ -39,7 +39,7 @@ llama.cpp's `--n-cpu-moe` then keeps only part of the expert FFN weights in syst
 ```bash
 llama-server \
   -m Qwen3.6-35B-A3B-MTP-UD-Q3_K_XL.gguf \
-  -ngl 99 -ncmoe 35 -fa on -t 6 -lm none -np 2 -kvu -ub 2048 \
+  -ngl 99 -ncmoe 35 -fa on -t 6 -lm none -np 1 -kvu -ub 2048 \
   -c 65536 -ctk q8_0 -ctv q8_0 -sps 0.5 -rea off \
   --spec-type draft-mtp,ngram-mod --spec-draft-n-max 2 \
   --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 \
@@ -49,7 +49,7 @@ llama-server \
 This is [`scripts/run-server.sh`](scripts/run-server.sh). It replaced the Qwen3-Coder-30B-A3B
 configuration below after the [A/B](#model-landscape-august-2026) showed +72% generation, +16% prompt
 processing and twice the context at the same VRAM. Everything this document establishes about `-ub`,
-`-np`, `-lm`, `-t` and the KV cache carries over unchanged — only the model, `-ncmoe`, `-c` and the
+`-lm`, `-t` and the KV cache carries over unchanged — only the model, `-ncmoe`, `-c`, `-np` and the
 sampling values differ.
 
 | Flag | Why |
@@ -69,7 +69,7 @@ want a coder-tuned model at a smaller download.
 ```bash
 llama-server \
   -m Qwen3-Coder-30B-A3B-Instruct-UD-Q3_K_XL.gguf \
-  -ngl 99 -ncmoe 40 -fa on -t 6 -lm none -np 2 -kvu -ub 2048 \
+  -ngl 99 -ncmoe 40 -fa on -t 6 -lm none -np 1 -kvu -ub 2048 \
   -c 65536 -ctk q8_0 -ctv q8_0 \
   --temp 0.7 --top-p 0.8 --top-k 20 --repeat-penalty 1.05 --min-p 0.0 \
   --host 127.0.0.1 --port 8080
@@ -79,7 +79,7 @@ llama-server \
 |---|---|
 | `-ncmoe 40` | Keep 40 of 48 layers' expert weights on the CPU; everything else on the GPU |
 | `-ub 2048` | Physical batch size. **+77% prompt processing** (407 → 722 t/s) at no measurable cost to generation — the largest single win for an agent workload |
-| `-np 2 -kvu` | Two slots, unified KV. The default of four slots evicts its own 20K+ prompt caches; `-np` alone silently turns unified KV *off* and halves per-slot context |
+| `-np 1 -kvu` | One slot, unified KV. Four slots evict each other's 20K+ prompt caches, and two slots starve each other of KV cells; Cline never issues a concurrent request. `-np` alone silently turns unified KV *off* and halves per-slot context |
 | `-c 65536` | Large enough that Cline rarely has to condense — each condense costs a 40–70 s prompt-cache rebuild |
 | `-lm none` | Load fully into RAM instead of mmap — removes page-fault overhead on offloaded tensors (prompt processing +34%) |
 | `-t 6` | Physical cores only. Using all 12 threads is **11% slower** (36.1 → 32.4 tok/s) |
@@ -196,9 +196,37 @@ hit rate and the share of wall time spent reprocessing.
 
 With the default of 4 slots, 14 of 18 slot selections in the session log fell back to LRU: four separate
 18–25K conversations were resident at once, 87K of demand against a 65K unified KV pool, evicting each
-other. Cline runs one conversation plus small auxiliary calls, so two slots suffice — and with exactly
-two, LRU sends the auxiliary call to the *other* slot and leaves the main prefix intact. Slot count
-costs no VRAM either way.
+other. Two slots was the first fix — the reasoning being that Cline runs one conversation plus small
+auxiliary calls, so LRU would send the auxiliary call to the *other* slot and leave the main prefix
+intact.
+
+**A 4.5-hour, 315-request session measured that reasoning and found it backwards.** Across 635
+launch/release events, **the two slots were never active at the same time** — Cline serialises
+completely, so the second slot bought nothing. What it cost is visible in the log:
+
+```
+slot get_availabl: id  1 | task -1 | selected slot by LRU
+state_read_meta: failed to find 36759 available cells in kv cache
+state_seq_set_data: error loading state: failed to restore kv cache
+slot  prompt_load: id  1 | task -1 | failed to load prompt from cache
+   → 46,099 tokens reprocessed, 61.2 s
+```
+
+The cached prompt existed. It could not be restored because **slot 0 was still holding 45,811 cells**
+of a different conversation, and 45,811 + 36,759 exceeds the 65,536 unified pool. Two slots do not
+each get a context — with `-kvu` they share one, and two Cline conversations of 40K each do not fit.
+
+The rest of that session says the same thing at lower volume:
+
+| | Requests | Prompt tokens | Prompt time |
+|---|---:|---:|---:|
+| Whole session | 315 | 626,508 | 1,032 s |
+| Of which LRU fallback | **24 (7.6%)** | **376,027 (60%)** | **442 s (43%)** |
+
+Every one of the 24 fallbacks reprocessed its prompt in full; 13% of all server time went to them.
+With one slot the auxiliary call still takes the slot, but the main conversation is then restored
+into an *empty* KV pool — a state copy instead of a 57-second reprocess. Slot count costs no VRAM
+either way (`-np 2` → `-np 1` gave back 210 MiB, which is checkpoint buffers, not weights).
 
 > **`-np N` silently disables unified KV.** Its default is "enabled only when the slot count is auto",
 > so `-np 2` alone turns `-c 65536` into 32768 per slot, which then breaks a client configured for a
@@ -463,6 +491,26 @@ the old configuration lost 0.66 GB and 9 faults.
 Nothing failed — no cgroup OOM, PSI flat at 0.00 across the run, 150 turns with zero errors. But the
 ceiling went from having slack to actively binding, so `MemoryHigh` is now **25G**, which returns about
 half the trimmed cache while still leaving the desktop ~6 GB at peak. `MemoryMax` stays 26G.
+
+#### What is actually in those 25 GB
+
+A 4.5-hour real session answered that, and the split is not what the model file suggests:
+
+```
+anon  9.00 GiB   ← prompt cache, at its -cram default of 8192 MiB, full
+file 12.58 GiB   ← the model's mmap pages — the file is 16.04 GiB, so 3.5 GiB has been reclaimed
+```
+
+**The prompt cache and the model's own weights compete for the same ceiling.** `-cram` defaults to
+8192 MiB and fills; the kernel then takes the difference out of the mmap'd weights. Over that session
+it evicted 20 prompt-cache entries (up to 2.1 GiB each) and racked up 1,372 `high` events — but only
+**12 major faults**, so what is being dropped is clean page cache the server is not currently reading.
+It is not hurting yet.
+
+It does mean neither axis has room. Raising `-cram` to hold more conversations pushes more of the
+model out to SSD; lowering it means more of the full reprocesses measured in
+[Slot count](#slot-count-np). On a 32GB host with a 16 GB model that trade is the binding constraint,
+and no flag escapes it.
 
 **The general lesson: `memory.peak` pinned exactly at `MemoryHigh` is not a measurement.** Read
 `pgmajfault` and the `file` trend next to it — those say whether the limit is comfortable or cutting.
@@ -748,7 +796,7 @@ Full measurement logs, per-flag reasoning, and the complete benchmark appendix a
 ```bash
 ~/llama.cpp/build-cuda-new/bin/llama-server \
   -m ~/models/Qwen3.6-35B-A3B-MTP-UD-Q3_K_XL.gguf \
-  -ngl 99 -ncmoe 35 -fa on -t 6 -lm none -np 2 -kvu -ub 2048 \
+  -ngl 99 -ncmoe 35 -fa on -t 6 -lm none -np 1 -kvu -ub 2048 \
   -c 65536 -ctk q8_0 -ctv q8_0 -sps 0.5 -rea off \
   --spec-type draft-mtp,ngram-mod --spec-draft-n-max 2 \
   --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 \
@@ -765,7 +813,7 @@ Full measurement logs, per-flag reasoning, and the complete benchmark appendix a
 - 샘플링 `--temp 1.0 --top-p 0.95 --top-k 20`: GGUF 메타데이터의 모델 권장값입니다. Qwen3-Coder용 0.7 / 0.8 / 1.05가 **아닙니다**
 - cline `contextWindow`는 **57344**(= 65536 − 생성 예약 8192)
 
-`-ub 2048`, `-np 2 -kvu`, `-lm none`, `-t 6`, KV 캐시 `q8_0` 등 이 문서가 확립한 나머지 결론은 그대로 유효합니다 — 모델과 `-ncmoe`, `-c`, 샘플링 값만 달라집니다.
+`-ub 2048`, `-kvu`, `-lm none`, `-t 6`, KV 캐시 `q8_0` 등 이 문서가 확립한 나머지 결론은 그대로 유효합니다 — 모델과 `-ncmoe`, `-c`, `-np`, 샘플링 값만 달라집니다.
 
 ### 이전 설정 (Qwen3-Coder-30B-A3B)
 
@@ -774,7 +822,7 @@ Full measurement logs, per-flag reasoning, and the complete benchmark appendix a
 ```bash
 ~/llama.cpp/build-cuda/bin/llama-server \
   -m ~/models/Qwen3-Coder-30B-A3B-Instruct-UD-Q3_K_XL.gguf \
-  -ngl 99 -ncmoe 40 -fa on -t 6 -lm none -np 2 -kvu -ub 2048 \
+  -ngl 99 -ncmoe 40 -fa on -t 6 -lm none -np 1 -kvu -ub 2048 \
   -c 65536 -ctk q8_0 -ctv q8_0 \
   --temp 0.7 --top-p 0.8 --top-k 20 --repeat-penalty 1.05 --min-p 0.0 \
   --host 127.0.0.1 --port 8080
@@ -783,7 +831,7 @@ Full measurement logs, per-flag reasoning, and the complete benchmark appendix a
 - **양자화: UD-Q3_K_XL (13.81GB)**. Q4_K_M(18.56GB) → IQ4_XS(16.38GB) → UD-Q3_K_XL 순으로 내려왔음. 아래 "성능 병목 분석"에서 밝혔듯 **생성 속도가 메모리 대역폭에 묶여 있어서, 전문가 가중치가 작아지는 것이 그대로 속도가 됨**. IQ4_XS 대비 파일 16% 감소 → `ncmoe` 34→32 (GPU에 2레이어 더) → **생성 속도 +14~19%**. Unsloth UD(Dynamic) 계열은 중요 텐서를 고정밀로 유지해 3비트대에서도 품질 저하를 최소화함.
 - `-ngl 99 -ncmoe 40`: 최대한 GPU에 올리되, 전문가 레이어 40개는 CPU에 남김. 32가 아니라 40인 이유는 `-ub 2048`을 태우기 위해서이며, 그 대가가 실질적으로 0인 것을 실측했습니다(아래 "에이전트 워크로드 튜닝" 참고)
 - **`-ub 2048`**: 물리 배치 크기. **프롬프트 처리 +77%(407 → 722 t/s)**, 생성 속도 손실은 측정 노이즈 이내. 이 구성에서 단일 변경으로 얻은 가장 큰 이득입니다
-- **`-np 2 -kvu`**: 슬롯 2개 + 통합 KV. 기본값 4슬롯은 서로의 20k+ 프롬프트 캐시를 축출합니다. **`-np`를 단독으로 주면 통합 KV가 조용히 꺼지면서** `-c 65536`이 슬롯당 32768로 반토막 나니 `-kvu`를 반드시 함께 주세요
+- **`-np 1 -kvu`**: 슬롯 1개 + 통합 KV. 4슬롯은 서로의 20k+ 프롬프트 캐시를 축출하고, 2슬롯은 서로에게서 KV 셀을 뺏습니다. Cline은 동시 요청을 보내지 않습니다. **`-np`를 단독으로 주면 통합 KV가 조용히 꺼지면서** `-c 65536`이 슬롯당 32768로 반토막 나니 `-kvu`를 반드시 함께 주세요
 - `-ctk q8_0 -ctv q8_0`: KV 캐시 8비트 양자화 — 품질 손실 거의 없이 여유 확보, 프롬프트 처리 속도 34% 향상(360→483 t/s)의 부수 효과
 - `-lm none`: `mmap` 대신 전량 RAM 직접 로드 — CPU 오프로드 텐서의 페이지 폴트 오버헤드 제거
 - `-fa on`: Flash Attention, 품질 손실 없이 무료 속도 향상
@@ -910,7 +958,28 @@ MoE 오프로드에서 전문가 가중치는 ubatch당 한 번 RAM에서 읽혀
 
 ### 슬롯 수 `-np`
 
-기본값 4슬롯에서는 세션 로그의 슬롯 선택 18회 중 **14회가 LCP 매칭 실패 후 LRU 폴백**이었습니다. 18~25k짜리 서로 다른 대화 4개가 동시에 올라가 **87k 수요가 65k 통합 KV 풀을 초과**하며 서로를 축출한 것입니다. Cline은 대화 1개 + 소형 보조 요청만 동시에 보내므로 2슬롯이면 충분하고, 정확히 2개일 때는 LRU 특성상 보조 요청이 항상 *반대쪽* 슬롯으로 가서 메인 접두부가 보존됩니다. 슬롯 수는 어느 쪽이든 VRAM에 영향이 없습니다.
+기본값 4슬롯에서는 세션 로그의 슬롯 선택 18회 중 **14회가 LCP 매칭 실패 후 LRU 폴백**이었습니다. 18~25k짜리 서로 다른 대화 4개가 동시에 올라가 **87k 수요가 65k 통합 KV 풀을 초과**하며 서로를 축출한 것입니다. 1차 수정이 2슬롯이었습니다 — Cline은 대화 1개 + 소형 보조 요청만 보내니, LRU가 보조 요청을 *반대쪽* 슬롯으로 보내 메인 접두부를 보존해 줄 것이라는 논리였습니다.
+
+**4시간 반, 315요청짜리 실세션이 그 논리를 측정했고, 거꾸로였습니다.** launch/release 이벤트 635건 동안 **두 슬롯이 동시에 활성인 적이 한 번도 없었습니다** — Cline은 완전히 순차로 보내므로 두 번째 슬롯이 버는 것이 없습니다. 대신 무엇을 치렀는지는 로그에 그대로 있습니다:
+
+```
+slot get_availabl: id  1 | task -1 | selected slot by LRU
+state_read_meta: failed to find 36759 available cells in kv cache
+state_seq_set_data: error loading state: failed to restore kv cache
+slot  prompt_load: id  1 | task -1 | failed to load prompt from cache
+   → 46,099토큰 전량 재처리, 61.2초
+```
+
+캐시된 프롬프트는 있었습니다. 복원하지 못한 이유는 **슬롯 0이 다른 대화의 셀 45,811개를 여전히 물고 있었기** 때문이고, 45,811 + 36,759은 통합 풀 65,536을 넘습니다. 슬롯 2개가 각자 컨텍스트를 갖는 것이 아닙니다 — `-kvu`에서는 하나를 나눠 쓰고, 40k짜리 Cline 대화 두 개는 거기 안 들어갑니다.
+
+같은 세션의 나머지도 같은 말을 더 낮은 목소리로 합니다:
+
+| | 요청 수 | 프롬프트 토큰 | 프롬프트 시간 |
+|---|---:|---:|---:|
+| 세션 전체 | 315 | 626,508 | 1,032초 |
+| 그중 LRU 폴백 | **24 (7.6%)** | **376,027 (60%)** | **442초 (43%)** |
+
+폴백 24건은 예외 없이 프롬프트를 전량 재처리했고, 서버 전체 시간의 13%가 거기 들어갔습니다. 슬롯이 하나면 보조 요청이 슬롯을 가져가는 것은 같지만, 메인 대화는 *빈* KV 풀로 복원됩니다 — 57초 재처리 대신 상태 복사입니다. 슬롯 수는 어느 쪽이든 VRAM에 영향이 없습니다(`-np 2` → `-np 1`로 210 MiB가 돌아왔는데, 가중치가 아니라 체크포인트 버퍼입니다).
 
 > **`-np N`을 주면 통합 KV가 조용히 꺼집니다.** `--kv-unified`의 기본값이 "슬롯 수가 auto일 때만 활성"이라서, `-np 2`만 주면 `-c 65536`이 슬롯당 32768이 되고 컨텍스트 윈도우를 57344로 설정한 클라이언트가 그대로 깨집니다. 반드시 `-kvu`를 함께 주세요.
 
@@ -1073,6 +1142,19 @@ sudo systemctl start systemd-zram-setup@zram0.service
 양쪽 다 정확히 24.00 GiB에서 피크인 이유는 `MemoryHigh`가 24G였기 때문입니다. **그 숫자는 워크로드의 수요가 아니라 상한이 자기 자신을 보고한 값입니다.** 수요는 상한이 무엇을 잘라냈는지에 나타납니다 — 커널이 **모델 자신의 페이지 캐시 2.0 GB**를 회수했고 서버는 그걸 다시 읽느라 major fault 101건을 먹었습니다. 옛 설정에서는 0.66 GB와 9건이었습니다.
 
 실패한 것은 없습니다 — cgroup OOM 0건, PSI 전 구간 0.00, 150턴 무오류. 다만 천장이 "여유 있음"에서 "실제로 물고 있음"으로 바뀌었으므로 `MemoryHigh`를 **25G**로 올렸습니다. 깎인 캐시의 절반쯤을 돌려받으면서 피크에도 데스크톱 몫 ~6 GB를 남깁니다. `MemoryMax`는 26G 그대로입니다.
+
+#### 그 25 GB 안에 실제로 뭐가 있나
+
+4시간 반짜리 실세션이 답을 줬는데, 모델 파일 크기만 보고 짐작한 것과 다릅니다:
+
+```
+anon  9.00 GiB   ← 프롬프트 캐시. -cram 기본값 8192 MiB 로 꽉 참
+file 12.58 GiB   ← 모델 mmap 페이지. 파일은 16.04 GiB 이므로 3.5 GiB 가 회수됨
+```
+
+**프롬프트 캐시와 모델 가중치가 같은 천장을 두고 경쟁하고 있습니다.** `-cram`은 기본 8192 MiB까지 차고, 커널은 그 차액을 mmap된 가중치에서 빼갑니다. 그 세션 동안 프롬프트 캐시 항목이 20번 축출됐고(하나에 최대 2.1 GiB) `high` 이벤트가 1,372회였지만, **major fault는 12회뿐**이었습니다 — 버려지는 것이 서버가 지금 읽고 있지 않은 깨끗한 페이지 캐시라는 뜻입니다. 아직은 해가 없습니다.
+
+다만 어느 쪽으로도 여유가 없다는 뜻이기도 합니다. 대화를 더 담으려고 `-cram`을 올리면 모델이 더 SSD로 밀려나고, 내리면 [슬롯 수](#슬롯-수--np) 절에서 측정한 전량 재처리가 늘어납니다. 16 GB 모델을 32GB 호스트에 올린 이상 이 교환이 곧 제약이고, 빠져나갈 플래그는 없습니다.
 
 **일반화하면: `memory.peak`이 `MemoryHigh`에 정확히 붙어 있으면 그건 측정값이 아닙니다.** 옆의 `pgmajfault`와 `file` 추이를 같이 읽으세요 — 상한이 편한지 자르고 있는지는 거기에 나옵니다.
 
