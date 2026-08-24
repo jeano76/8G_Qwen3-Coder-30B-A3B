@@ -4,7 +4,7 @@
 
 Measured notes and the running configuration for a 30B-class coding LLM at usable speed on a single 8GB GPU. Every number below was measured on the machine described here — including the approaches that turned out to be slower. The work started on Qwen3-Coder-30B-A3B; the current configuration runs Qwen3.6-35B-A3B, and both are documented.
 
-**Result: a 35B-parameter model with a 64K context on a GPU that holds neither** — 38.2 tok/s generation and 970 t/s prompt processing at a real 22K-token Cline working context, up from 21.1 tok/s on the model this document started with.
+**Result: a 35B-parameter model with a 64K context on a GPU that holds neither** — 44.7 tok/s generation and 928 t/s prompt processing at a real 22K-token Cline working context, up from 21.1 tok/s on the model this document started with. The last 17.7% of that generation figure comes from MTP, measured in [Speculative decoding](#speculative-decoding-mtp-pays-n-gram-does-not).
 
 The context was 128K until a session that actually filled it exhausted host RAM and froze the machine. That is documented in [Host RAM](#host-ram-the-failure-mode-vram-numbers-do-not-predict), along with the measurement that shows 64K costs nothing to give up.
 
@@ -38,9 +38,10 @@ llama.cpp's `--n-cpu-moe` then keeps only part of the expert FFN weights in syst
 
 ```bash
 llama-server \
-  -m Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf \
-  -ngl 99 -ncmoe 33 -fa on -t 6 -lm none -np 2 -kvu -ub 2048 \
+  -m Qwen3.6-35B-A3B-MTP-UD-Q3_K_XL.gguf \
+  -ngl 99 -ncmoe 35 -fa on -t 6 -lm none -np 2 -kvu -ub 2048 \
   -c 65536 -ctk q8_0 -ctv q8_0 -sps 0.5 -rea off \
+  --spec-type draft-mtp --spec-draft-n-max 2 \
   --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 \
   --host 127.0.0.1 --port 8080
 ```
@@ -53,7 +54,8 @@ sampling values differ.
 
 | Flag | Why |
 |---|---|
-| `-ncmoe 33` | Keep 33 of 40 layers' expert weights on the CPU. The OOM floor at this context is 32 |
+| `-ncmoe 35` | Keep 35 of 40 layers' expert weights on the CPU. MTP needs more VRAM than the plain model: 33 loads but dies mid-inference, and 35 measured faster than 34 — see [Speculative decoding](#speculative-decoding-mtp-pays-n-gram-does-not) |
+| `--spec-type draft-mtp --spec-draft-n-max 2` | Multi-token prediction, **+17.7% generation** against the same file with MTP off. Requires the `-MTP-` GGUF build of the model |
 | `-c 65536` | Puts Cline's condense threshold at 61K — still far above the 28.3K that observed sessions actually reach, so prompt-cache rebuilds stop happening. Was 131072 until a full 128K context OOM'd the host; see [Host RAM](#host-ram-the-failure-mode-vram-numbers-do-not-predict) |
 | `-sps 0.5` | Slot-prompt similarity floor. The default of 0.10 lets a barely-related prompt claim a slot holding a 60K cache and destroy it |
 | `-rea off` | Disable thinking. Thought tokens are latency on every single tool call in an agent loop |
@@ -200,7 +202,7 @@ costs no VRAM either way.
 
 > **`-np N` silently disables unified KV.** Its default is "enabled only when the slot count is auto",
 > so `-np 2` alone turns `-c 65536` into 32768 per slot, which then breaks a client configured for a
-> 61440 context window. Always pass `-kvu` with it.
+> 57344 context window. Always pass `-kvu` with it.
 
 ### Slot-prompt similarity (`-sps`) — what still stalls
 
@@ -453,14 +455,74 @@ Raising `-c` by itself does not fix this — Cline fills whatever it is given (r
   "baseUrl": "http://127.0.0.1:8080/v1",
   "apiKey": "sk-no-key-required",
   "model": "Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf",
-  "contextWindow": 61440,
+  "contextWindow": 57344,
   "maxTokens": 4096
 }
 ```
 
-Keep `contextWindow` in sync with the server: `-c` minus `maxTokens`. Do not set it lower than it has to be — condensing is what destroys the prompt cache, so a needlessly small window costs far more than it saves.
+Keep `contextWindow` in sync with the server, and **do not compute it from `maxTokens`.** That field is
+not what goes on the wire: with `maxTokens: 4096` set, the server's slot reported `n_predict = 32000`.
+Reserve a realistic slice for generation instead — 8192 here, against a measured median of 119 and a
+maximum of 1,897 generated tokens — so `contextWindow` is `-c` minus 8192 = **57344**.
+
+The cost of getting this wrong is not theoretical. It was `126976`, left over from when `-c` was
+131072, and Cline grew a conversation to 67,992 tokens against a 65,536 window before the server
+hard-errored. Corrected to 61440, a session still reached **65,207 tokens — 329 short of the wall.**
+Do not set it lower than it has to be either: condensing is what destroys the prompt cache, so a
+needlessly small window costs far more than it saves. The watchdog checks this every 60s.
 
 Note that Cline only sends sampling parameters when they are explicitly configured, so the server-side defaults above are what it actually gets.
+
+## Speculative decoding: MTP pays, n-gram does not
+
+Three ideas were measured against the running configuration on the same fixed 21,525-token prompt,
+median of 3 (`scripts/bench-model.sh`, binary selected with `LLAMA_SERVER`, flags with `EXTRA_ARGS`).
+
+**Same model, `-ncmoe 33`:**
+
+| Variant | Prompt processing | Generation @22K | Generation, short ctx | VRAM |
+|---|---:|---:|---:|---:|
+| build `07822bd` (baseline) | 976.7 t/s | 38.90 tok/s | 42.8 | 6,398 MiB |
+| build `7584430` (+57 commits) | 975.3 t/s | 38.89 tok/s | 43.6 | 6,398 MiB |
+| `--spec-type ngram-mod` | 976.7 t/s | 38.94 tok/s | 43.8 | 6,415 MiB |
+| `--spec-type ngram-cache` | 972.9 t/s | **33.63 tok/s** | 41.5 | 6,415 MiB |
+
+**The rebuild bought nothing.** Every figure is inside run-to-run noise. Recorded so it is not tried
+again — the earlier build update that gave +16% was a different range of commits.
+
+`ngram-cache` costs **13.5% of generation**; reject it. `ngram-mod` leaves the median untouched, but
+one run of the three hit 74.55 tok/s — 1.9x. That is how speculation behaves: a hit wins big, a miss
+costs nothing. Three repetitions of one fixed prompt crush that variance into the median, so this
+benchmark can neither confirm nor refute a gain on real agent traffic. It is not adopted, and it is
+not disproven either.
+
+**MTP.** This needs a different file — the `-MTP-` GGUF (16.04 GB, 753 tensors against 733; the extra
+20 are the MTP head). The control row is that same file at the same `-ncmoe` with MTP switched off, so
+the comparison isolates the feature rather than the download:
+
+| Config | `-ncmoe` | Prompt processing | Generation @22K | Generation, short ctx | VRAM |
+|---|---|---:|---:|---:|---:|
+| MTP off (control) | 35 | 956.0 t/s | 37.97 tok/s | 42.4 | 5,827 MiB |
+| MTP on | 33 | — | *dies mid-inference* | — | 7,699 MiB |
+| MTP on | 34 | 942.1 t/s | 43.92 tok/s | **49.2** | 7,369 MiB |
+| **MTP on** | **35** | **928.3 t/s** | **44.69 tok/s** | 48.5 | **7,035 MiB** |
+| MTP on | 36 | 918.7 t/s | 43.90 tok/s | 35.6 | 6,705 MiB |
+
+**+17.7% generation for −2.9% prompt processing**, at the same `-ncmoe`, same file. Against the
+previous production configuration (plain model, `-ncmoe 33`) it is +14.9% generation and −5.0% prompt.
+
+That trade is right for an agent workload for a reason this document already measured: a real hour of
+Cline spends **72% of wall clock generating** (644.6s of 900.3s) and 28% on prompt processing.
+
+Two things the table shows that a load-time VRAM figure would not. `-ncmoe 33` *loads* at 7,699 MiB and
+then dies during inference — MTP's draft path needs headroom that does not appear until it runs. And 36
+gives back most of the generation while collapsing short-context generation to 35.6; 35 is the optimum,
+not merely the largest that fits.
+
+> **Host RAM.** `-ncmoe 35` puts two more layers of experts in system RAM and the file is 0.35 GB
+> larger, so peak host RSS runs above the 24.00 GiB measured for the old configuration against
+> `MemoryHigh=24G`. Watch the `high` growth rate in `pressure.log` over a long session before assuming
+> the limits still fit — see [Host RAM](#host-ram-the-failure-mode-vram-numbers-do-not-predict).
 
 ## Model landscape, August 2026
 
@@ -586,22 +648,24 @@ Full measurement logs, per-flag reasoning, and the complete benchmark appendix a
 ## 현재 설정
 
 ```bash
-~/llama.cpp/build-cuda/bin/llama-server \
-  -m ~/models/Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf \
-  -ngl 99 -ncmoe 33 -fa on -t 6 -lm none -np 2 -kvu -ub 2048 \
+~/llama.cpp/build-cuda-new/bin/llama-server \
+  -m ~/models/Qwen3.6-35B-A3B-MTP-UD-Q3_K_XL.gguf \
+  -ngl 99 -ncmoe 35 -fa on -t 6 -lm none -np 2 -kvu -ub 2048 \
   -c 65536 -ctk q8_0 -ctv q8_0 -sps 0.5 -rea off \
+  --spec-type draft-mtp --spec-draft-n-max 2 \
   --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 \
   --host 127.0.0.1 --port 8080
 ```
 
 체크인된 [`scripts/run-server.sh`](scripts/run-server.sh)가 이 설정입니다. 아래 "2026년 8월 기준 모델 지형"의 A/B 실측에서 동일 VRAM으로 **생성 +72%, 프롬프트 처리 +16%, 컨텍스트 2배**가 확인되어 Qwen3-Coder-30B-A3B 설정을 대체했습니다.
 
-- `-ncmoe 33`: 40개 레이어 중 33개의 전문가 가중치를 CPU에. 이 컨텍스트에서 OOM 바닥은 32입니다
+- `-ncmoe 35`: 40개 레이어 중 35개의 전문가 가중치를 CPU에. MTP는 일반 모델보다 VRAM을 더 먹어서 33은 로드는 되지만 추론 중에 죽고, 34보다 35가 더 빨랐습니다([투기적 디코딩](#투기적-디코딩--mtp는-값을-하고-n-gram은-못-한다) 절)
+- **`--spec-type draft-mtp --spec-draft-n-max 2`**: 멀티 토큰 예측. 같은 파일에서 MTP만 끈 대조군 대비 **생성 +17.7%**. 모델의 `-MTP-` GGUF 빌드가 필요합니다
 - `-c 65536`: Cline 압축 임계를 61k에 놓습니다. 실측 세션이 실제로 도달하는 28.3k보다 한참 위라 캐시 재구축이 일어나지 않습니다. 131072를 쓰다가 128k를 실제로 채운 세션이 호스트를 OOM으로 몰아 낮췄습니다([호스트 RAM](#호스트-ram--vram-수치가-예측해주지-않는-고장) 절)
 - **`-sps 0.5`**: 슬롯 재사용 최소 유사도. 기본값 0.10은 거의 무관한 프롬프트가 6만 토큰 캐시를 들고 있는 슬롯을 차지해 파괴하도록 허용합니다(아래 절 참고)
 - `-rea off`: thinking 차단. 에이전트 루프에서는 사고 토큰이 매 툴 콜마다 지연으로 쌓입니다
 - 샘플링 `--temp 1.0 --top-p 0.95 --top-k 20`: GGUF 메타데이터의 모델 권장값입니다. Qwen3-Coder용 0.7 / 0.8 / 1.05가 **아닙니다**
-- cline `contextWindow`는 **61440**(= 65536 − 4096)
+- cline `contextWindow`는 **57344**(= 65536 − 생성 예약 8192)
 
 `-ub 2048`, `-np 2 -kvu`, `-lm none`, `-t 6`, KV 캐시 `q8_0` 등 이 문서가 확립한 나머지 결론은 그대로 유효합니다 — 모델과 `-ncmoe`, `-c`, 샘플링 값만 달라집니다.
 
@@ -750,7 +814,7 @@ MoE 오프로드에서 전문가 가중치는 ubatch당 한 번 RAM에서 읽혀
 
 기본값 4슬롯에서는 세션 로그의 슬롯 선택 18회 중 **14회가 LCP 매칭 실패 후 LRU 폴백**이었습니다. 18~25k짜리 서로 다른 대화 4개가 동시에 올라가 **87k 수요가 65k 통합 KV 풀을 초과**하며 서로를 축출한 것입니다. Cline은 대화 1개 + 소형 보조 요청만 동시에 보내므로 2슬롯이면 충분하고, 정확히 2개일 때는 LRU 특성상 보조 요청이 항상 *반대쪽* 슬롯으로 가서 메인 접두부가 보존됩니다. 슬롯 수는 어느 쪽이든 VRAM에 영향이 없습니다.
 
-> **`-np N`을 주면 통합 KV가 조용히 꺼집니다.** `--kv-unified`의 기본값이 "슬롯 수가 auto일 때만 활성"이라서, `-np 2`만 주면 `-c 65536`이 슬롯당 32768이 되고 컨텍스트 윈도우를 61440으로 설정한 클라이언트가 그대로 깨집니다. 반드시 `-kvu`를 함께 주세요.
+> **`-np N`을 주면 통합 KV가 조용히 꺼집니다.** `--kv-unified`의 기본값이 "슬롯 수가 auto일 때만 활성"이라서, `-np 2`만 주면 `-c 65536`이 슬롯당 32768이 되고 컨텍스트 윈도우를 57344로 설정한 클라이언트가 그대로 깨집니다. 반드시 `-kvu`를 함께 주세요.
 
 ### 슬롯 유사도 `-sps` — 그래도 남는 멈춤
 
@@ -966,7 +1030,7 @@ models:
     model: Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf
     apiBase: http://127.0.0.1:8080/v1
     apiKey: none
-    contextLength: 61440
+    contextLength: 57344
     capabilities:
       - tool_use   # 빠뜨리면 Continue.dev가 파일 읽기 등 에이전트/툴 기능을 아예 시도하지 않음
     roles:
@@ -1004,7 +1068,7 @@ Cline CLI를 쓴다면 `~/.cline/data/settings/providers.json`:
         "apiKey": "sk-no-key-required",
         "model": "Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf",
         "baseUrl": "http://127.0.0.1:8080/v1",
-        "contextWindow": 61440,
+        "contextWindow": 57344,
         "maxTokens": 4096
       }
     }
@@ -1014,7 +1078,9 @@ Cline CLI를 쓴다면 `~/.cline/data/settings/providers.json`:
 
 수정 후 Cline을 완전히 종료했다 재실행해야 반영됩니다(실행 중이면 종료 시 덮어씁니다).
 
-`contextWindow`는 서버 `-c` 값에서 `maxTokens`를 뺀 값으로 맞추세요. 현재 `-c 65536` / `maxTokens 4096` 이므로 **`61440`** 입니다. 필요 이상으로 작게 잡지 마세요 — 압축이 프롬프트 캐시를 파괴하므로, 작은 윈도우는 아끼는 것보다 훨씬 큰 비용을 물립니다(바로 아래 절 참고).
+`contextWindow`는 서버 `-c`에 맞추되, **`maxTokens`에서 빼서 계산하지 마세요.** 그 필드는 실제로 전송되는 값이 아닙니다 — `maxTokens: 4096`을 넣어둔 상태에서 서버 슬롯이 보고한 `n_predict`는 **32000**이었습니다. 대신 생성용으로 현실적인 몫을 예약하세요. 실측 생성 길이가 중앙값 119 / 최대 1,897 토큰이므로 8192면 충분하고, `contextWindow`는 `-c` − 8192 = **`57344`** 입니다.
+
+이걸 틀렸을 때의 대가는 이론이 아닙니다. `-c`가 131072이던 시절 값 `126976`이 그대로 남아 있었고, Cline이 65,536 창에 67,992 토큰짜리 대화를 밀어 넣어 서버가 하드 에러를 냈습니다. `61440`으로 고친 뒤에도 세션이 **65,207 토큰까지 갔습니다 — 벽에서 329 토큰 남은 값입니다.** 그렇다고 필요 이상으로 작게 잡지도 마세요 — 압축이 프롬프트 캐시를 파괴하므로 작은 윈도우는 아끼는 것보다 훨씬 큰 비용을 물립니다. 워치독이 이 값을 60초마다 검사합니다.
 
 참고로 서버 쪽에서 컨텍스트를 늘려 해결하려면 `ncmoe`를 올려야 해서 속도를 내줘야 합니다(UD-Q3_K_XL 기준 실측):
 
@@ -1209,6 +1275,41 @@ Cline의 압축처럼 요약문이 **삽입**되는 변형은 원리적으로 �
 | Qwen2.5-Coder-7B (덴스, 전체 GPU) | 64.44 | 58.4 |
 
 > 7B가 raw 속도는 가장 빠르지만 버그 발생률 때문에 채택하지 않았습니다. 자세한 내용은 위 "모델 비교 벤치마크"와 "왜 MoE인가" 참고.
+
+## 투기적 디코딩 — MTP는 값을 하고 n-gram은 못 한다
+
+세 가지를 현재 설정 대비로 측정했습니다. 같은 고정 프롬프트(21,525토큰), 각 3회 중앙값 (`scripts/bench-model.sh`, 바이너리는 `LLAMA_SERVER`로, 플래그는 `EXTRA_ARGS`로 지정).
+
+**같은 모델, `-ncmoe 33`:**
+
+| 변형 | 프롬프트 처리 | 생성 @22K | 생성, 짧은 컨텍스트 | VRAM |
+|---|---:|---:|---:|---:|
+| 빌드 `07822bd` (기준선) | 976.7 t/s | 38.90 tok/s | 42.8 | 6,398 MiB |
+| 빌드 `7584430` (+57커밋) | 975.3 t/s | 38.89 tok/s | 43.6 | 6,398 MiB |
+| `--spec-type ngram-mod` | 976.7 t/s | 38.94 tok/s | 43.8 | 6,415 MiB |
+| `--spec-type ngram-cache` | 972.9 t/s | **33.63 tok/s** | 41.5 | 6,415 MiB |
+
+**재빌드는 아무것도 주지 않았습니다.** 모든 수치가 측정 편차 안입니다. 다시 시도하지 않도록 기록해 둡니다 — 앞서 +16%를 준 빌드 갱신은 다른 커밋 구간이었습니다.
+
+`ngram-cache`는 **생성을 13.5% 깎습니다.** 기각입니다. `ngram-mod`는 중앙값이 그대로인데 3회 중 1회가 74.55 tok/s로 **1.9배**였습니다. 투기 디코딩은 원래 이렇게 동작합니다 — 맞으면 크게 이기고 빗나가면 본전입니다. 고정 프롬프트 3회 반복은 그 분산을 중앙값으로 눌러버리므로, 이 벤치로는 실사용 이득을 **확인할 수도 부정할 수도 없습니다.** 채택하지 않되 기각도 아닙니다.
+
+**MTP.** 파일이 다릅니다 — `-MTP-` GGUF(16.04 GB, 텐서 753개 대 733개, 늘어난 20개가 MTP 헤드). 대조군은 **같은 파일, 같은 `-ncmoe`에서 MTP만 끈 값**이라, 비교가 다운로드가 아니라 기능 자체를 분리합니다:
+
+| 설정 | `-ncmoe` | 프롬프트 처리 | 생성 @22K | 생성, 짧은 컨텍스트 | VRAM |
+|---|---|---:|---:|---:|---:|
+| MTP 끔 (대조군) | 35 | 956.0 t/s | 37.97 tok/s | 42.4 | 5,827 MiB |
+| MTP 켬 | 33 | — | *추론 중 사망* | — | 7,699 MiB |
+| MTP 켬 | 34 | 942.1 t/s | 43.92 tok/s | **49.2** | 7,369 MiB |
+| **MTP 켬** | **35** | **928.3 t/s** | **44.69 tok/s** | 48.5 | **7,035 MiB** |
+| MTP 켬 | 36 | 918.7 t/s | 43.90 tok/s | 35.6 | 6,705 MiB |
+
+같은 `-ncmoe`, 같은 파일에서 **프롬프트 처리 −2.9%를 내주고 생성 +17.7%**를 얻습니다. 이전 운용 설정(일반 모델, `-ncmoe 33`) 대비로는 생성 +14.9%, 프롬프트 −5.0%입니다.
+
+이 교환이 에이전트 워크로드에서 맞는 이유는 이 문서가 이미 측정해 둔 값에 있습니다 — 실제 Cline 1시간은 **벽시계의 72%를 생성에 씁니다**(900.3초 중 644.6초). 프롬프트 처리는 28%입니다.
+
+로드 시점 VRAM 수치로는 안 보이는 것이 표에 둘 있습니다. `-ncmoe 33`은 7,699 MiB로 **로드까지는 되고** 추론 중에 죽습니다 — MTP의 드래프트 경로가 요구하는 여유는 실행해야 드러납니다. 그리고 36은 생성을 거의 돌려주면서 짧은 컨텍스트 생성을 35.6으로 무너뜨립니다. 35는 "들어가는 최대값"이 아니라 **최적값**입니다.
+
+> **호스트 RAM.** `-ncmoe 35`는 익스퍼트 두 레이어를 시스템 RAM으로 더 내리고 파일도 0.35 GB 큽니다. 따라서 호스트 RSS 피크가 옛 설정에서 측정한 24.00 GiB(상한 `MemoryHigh=24G`)보다 위로 올라갑니다. 긴 세션에서 `pressure.log`의 `high` 증가 속도를 확인하기 전에는 상한이 그대로 맞는다고 가정하지 마세요 — [호스트 RAM](#호스트-ram--vram-수치가-예측해주지-않는-고장) 절 참고.
 
 ## 2026년 8월 기준 모델 지형
 
