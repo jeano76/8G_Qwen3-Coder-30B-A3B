@@ -12,10 +12,12 @@ ExecStart=%h/bin/run-server.sh
 # 호스트 RAM 상한. 이걸 걸지 않으면 컨텍스트가 가득 찬 세션이
 # 시스템 전체를 OOM으로 몰아 머신이 얼어붙는다(README "호스트 RAM" 절).
 #
-# MemoryHigh 는 모델 파일(15.69GiB)보다 반드시 커야 한다. 16G 로 잡았더니
+# MemoryHigh 는 모델 파일(MTP 16.04GiB)보다 반드시 커야 한다. 16G 로 잡았더니
 # mmap 된 가중치만으로 상한에 붙어, cgroup 이 상시 회수 상태가 되고
 # 서버가 자기 가중치를 버렸다 SSD 에서 다시 읽는 스톨이 났다.
-MemoryHigh=24G
+# 24G 는 -ncmoe 35 + MTP 에서 실제로 물었다(20분 부하에 캐시 2.0GB 회수,
+# major fault +101). 그래서 25G. README "MTP가 천장에 한 일" 절.
+MemoryHigh=25G
 MemoryMax=26G
 MemorySwapMax=4G
 

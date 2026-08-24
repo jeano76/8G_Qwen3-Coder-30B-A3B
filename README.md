@@ -309,7 +309,7 @@ same hardware and prompt. That gain is the llama.cpp build, not this configurati
 
 ```ini
 # scripts/llama-server.service
-MemoryHigh=24G                # must exceed the model file; see below
+MemoryHigh=25G                # must exceed the model file; see below
 MemoryMax=26G                 # hard backstop, leaves ~5GB for the desktop
 MemorySwapMax=4G
 Restart=on-failure
@@ -337,7 +337,8 @@ memory.stat:    file 16.75GB / anon 0.32GB, pgsteal 3.19M pages
 The server evicts its own weights and re-reads them from the SSD, forever. That is a stall that looks
 exactly like the freeze the limit was meant to prevent — and it is self-inflicted, because the host had
 10GB free the whole time. Size `MemoryHigh` above the model plus everything around it and keep
-`MemoryMax` as the hard backstop; on this 32GB machine that is 24G and 26G.
+`MemoryMax` as the hard backstop; on this 32GB machine that was 24G and 26G, and 25G/26G once MTP
+raised the floor — see [What MTP did to the ceiling](#what-mtp-did-to-the-ceiling).
 
 ### Verifying it: a 20-minute session that actually fills the window
 
@@ -374,7 +375,7 @@ That is fine, and the difference from the earlier stall is the whole point: `pgm
 The kernel dropped cache it did not need back, rather than re-reading the model on every pass (3116
 events in three minutes, idle, when the limit was 16G). `MemoryHigh` behaved as the soft ceiling it is
 supposed to be. Raising it further on a 32GB host would push the desktop's headroom under 5GB and
-recreate the same failure from the other side, so 24G/26G stays. If long sessions feel slow late, read
+recreate the same failure from the other side, so 24G/26G stood until MTP. If long sessions feel slow late, read
 the `high` growth rate and the `file` shrink in `pressure.log` first — that is this ceiling being hit.
 
 The other half is swap. This machine had none, which is why memory pressure became a livelock instead
@@ -438,6 +439,33 @@ cp scripts/llama-watchdog.sh ~/bin/ && chmod +x ~/bin/llama-watchdog.sh
 cp scripts/llama-watchdog.{service,timer} ~/.config/systemd/user/
 systemctl --user daemon-reload && systemctl --user enable --now llama-watchdog.timer
 ```
+
+### What MTP did to the ceiling
+
+`-ncmoe 35` and the 16.04 GB MTP file were run through the same 20-minute load. The peak is identical
+and that is the trap:
+
+| | plain model, `-ncmoe 33` | MTP, `-ncmoe 35` |
+|---|---:|---:|
+| Idle `cur` | 16.00G | 17.88G |
+| `memory.peak` | 24.00 GiB | 24.00 GiB |
+| `high` events during load | 113 | **269** |
+| `file` cache trimmed | −0.66G | **−1.98G** |
+| `pgmajfault` | +9 | **+101** |
+| Lowest `MemAvailable` | 7.86G | 6.99G |
+| `max` / `oom_kill` | 0 / 0 | 0 / 0 |
+
+Both peak at exactly 24.00 GiB because `MemoryHigh` was 24G — that number is the limit reporting
+itself, not the workload's demand. The demand shows up in what the limit had to cut: the kernel took
+**2.0 GB of the model's own page cache** back and the server ate 101 major faults re-reading it, where
+the old configuration lost 0.66 GB and 9 faults.
+
+Nothing failed — no cgroup OOM, PSI flat at 0.00 across the run, 150 turns with zero errors. But the
+ceiling went from having slack to actively binding, so `MemoryHigh` is now **25G**, which returns about
+half the trimmed cache while still leaving the desktop ~6 GB at peak. `MemoryMax` stays 26G.
+
+**The general lesson: `memory.peak` pinned exactly at `MemoryHigh` is not a measurement.** Read
+`pgmajfault` and the `file` trend next to it — those say whether the limit is comfortable or cutting.
 
 ## Client setup (Cline)
 
@@ -521,8 +549,8 @@ not merely the largest that fits.
 
 > **Host RAM.** `-ncmoe 35` puts two more layers of experts in system RAM and the file is 0.35 GB
 > larger, so peak host RSS runs above the 24.00 GiB measured for the old configuration against
-> `MemoryHigh=24G`. Watch the `high` growth rate in `pressure.log` over a long session before assuming
-> the limits still fit — see [Host RAM](#host-ram-the-failure-mode-vram-numbers-do-not-predict).
+> `MemoryHigh`. That was measured afterwards and the limit moved to 25G — see
+> [What MTP did to the ceiling](#what-mtp-did-to-the-ceiling).
 
 ## Model landscape, August 2026
 
@@ -890,7 +918,7 @@ Free swap = 0kB   Total swap = 0kB
 
 ```ini
 # scripts/llama-server.service
-MemoryHigh=24G                # 모델 파일보다 커야 한다 — 아래 참고
+MemoryHigh=25G                # 모델 파일보다 커야 한다 — 아래 참고
 MemoryMax=26G                 # 하드 백스톱, 데스크톱 몫 ~5GB를 남긴다
 MemorySwapMax=4G
 Restart=on-failure
@@ -908,7 +936,7 @@ memory.events:  high 3116         # 3분 동안, 유휴, 요청 처리 없음
 memory.stat:    file 16.75GB / anon 0.32GB, pgsteal 3.19M pages
 ```
 
-서버가 자기 가중치를 버렸다가 SSD에서 다시 읽기를 끝없이 반복합니다. 이건 상한이 막으려던 프리즈와 **똑같아 보이는 스톨**이고, 그 내내 호스트에는 10GB가 남아 있었으니 자초한 것입니다. `MemoryHigh`는 모델 + 주변 할당을 모두 담을 만큼 잡고, `MemoryMax`를 하드 백스톱으로 남기세요. 이 32GB 머신에서는 24G / 26G입니다.
+서버가 자기 가중치를 버렸다가 SSD에서 다시 읽기를 끝없이 반복합니다. 이건 상한이 막으려던 프리즈와 **똑같아 보이는 스톨**이고, 그 내내 호스트에는 10GB가 남아 있었으니 자초한 것입니다. `MemoryHigh`는 모델 + 주변 할당을 모두 담을 만큼 잡고, `MemoryMax`를 하드 백스톱으로 남기세요. 이 32GB 머신에서는 24G / 26G였고, MTP 도입으로 바닥이 올라간 뒤 25G / 26G입니다([MTP가 천장에 한 일](#mtp가-천장에-한-일) 절).
 
 ### 검증 — 창을 실제로 채우는 20분 세션
 
@@ -936,7 +964,7 @@ memory.stat:    file 16.75GB / anon 0.32GB, pgsteal 3.19M pages
 
 **다만 24G가 넉넉한 값은 아닙니다.** 64K를 채우는 세션은 대략 24.5GB를 요구하고(모델 15.7GB 위에 anon 8.86GB), 그래서 23:13부터 cgroup이 `MemoryHigh`에 **붙은 채로** 있었고 `high` 카운터가 다시 돌기 시작했습니다 — 8분에 113건, `file`은 15.63GB에서 14.97GB로 깎였습니다.
 
-그래도 괜찮고, 앞선 스톨과의 차이가 바로 요점입니다: `pgmajfault`는 **9** 증가했습니다. 커널이 되돌려 읽을 필요 없는 캐시만 버렸다는 뜻입니다 — 상한이 16G였을 때는 유휴 상태 3분에 3116 이벤트였습니다. `MemoryHigh`가 원래 의도대로 **부드러운 천장**으로 동작했습니다. 32GB 호스트에서 이보다 더 올리면 데스크톱 여유가 5GB 아래로 내려가 같은 고장을 반대편에서 만들게 되므로 24G/26G를 유지합니다. 긴 세션 후반이 느리게 느껴지면 `pressure.log`의 `high` 증가 속도와 `file` 감소를 먼저 보세요 — 이 천장에 닿았다는 신호입니다.
+그래도 괜찮고, 앞선 스톨과의 차이가 바로 요점입니다: `pgmajfault`는 **9** 증가했습니다. 커널이 되돌려 읽을 필요 없는 캐시만 버렸다는 뜻입니다 — 상한이 16G였을 때는 유휴 상태 3분에 3116 이벤트였습니다. `MemoryHigh`가 원래 의도대로 **부드러운 천장**으로 동작했습니다. 32GB 호스트에서 이보다 더 올리면 데스크톱 여유가 5GB 아래로 내려가 같은 고장을 반대편에서 만들게 되므로 24G/26G를 유지했습니다(MTP 도입 후 25G). 긴 세션 후반이 느리게 느껴지면 `pressure.log`의 `high` 증가 속도와 `file` 감소를 먼저 보세요 — 이 천장에 닿았다는 신호입니다.
 
 나머지 절반은 스왑입니다. 이 머신엔 스왑이 없었고, 그래서 메모리 압박이 프로세스 종료가 아니라 **라이브락**이 됐습니다. zram 12GB(zstd)는 디스크를 쓰지 않고 이 워크로드가 만드는 anon 페이지를 잘 압축합니다:
 
@@ -957,6 +985,26 @@ sudo systemctl start systemd-zram-setup@zram0.service
 > 우분투 24.04의 `systemd-zram-generator` 0.3.2는 `zram-size` 키를 **모릅니다.** 그 키를 쓰면 조용히 무시하고 기본값(램의 절반, 최대 4096MB)으로 잡습니다. 위처럼 `zram-fraction` + `max-zram-size`를 쓰세요. 크기를 바꾼 뒤에는 `--reset-device zram0`을 거쳐야 반영됩니다.
 
 둘을 모두 걸어두면 동일한 과할당이 하드 리셋이 아니라 로그 한 줄로 끝납니다.
+
+### MTP가 천장에 한 일
+
+`-ncmoe 35`와 16.04 GB MTP 파일로 같은 20분 부하를 돌렸습니다. 피크가 동일한데, 바로 그게 함정입니다:
+
+| | 일반 모델, `-ncmoe 33` | MTP, `-ncmoe 35` |
+|---|---:|---:|
+| 유휴 `cur` | 16.00G | 17.88G |
+| `memory.peak` | 24.00 GiB | 24.00 GiB |
+| 부하 중 `high` 이벤트 | 113건 | **269건** |
+| 깎인 `file` 캐시 | −0.66G | **−1.98G** |
+| `pgmajfault` | +9 | **+101** |
+| `MemAvailable` 최저 | 7.86G | 6.99G |
+| `max` / `oom_kill` | 0 / 0 | 0 / 0 |
+
+양쪽 다 정확히 24.00 GiB에서 피크인 이유는 `MemoryHigh`가 24G였기 때문입니다. **그 숫자는 워크로드의 수요가 아니라 상한이 자기 자신을 보고한 값입니다.** 수요는 상한이 무엇을 잘라냈는지에 나타납니다 — 커널이 **모델 자신의 페이지 캐시 2.0 GB**를 회수했고 서버는 그걸 다시 읽느라 major fault 101건을 먹었습니다. 옛 설정에서는 0.66 GB와 9건이었습니다.
+
+실패한 것은 없습니다 — cgroup OOM 0건, PSI 전 구간 0.00, 150턴 무오류. 다만 천장이 "여유 있음"에서 "실제로 물고 있음"으로 바뀌었으므로 `MemoryHigh`를 **25G**로 올렸습니다. 깎인 캐시의 절반쯤을 돌려받으면서 피크에도 데스크톱 몫 ~6 GB를 남깁니다. `MemoryMax`는 26G 그대로입니다.
+
+**일반화하면: `memory.peak`이 `MemoryHigh`에 정확히 붙어 있으면 그건 측정값이 아닙니다.** 옆의 `pgmajfault`와 `file` 추이를 같이 읽으세요 — 상한이 편한지 자르고 있는지는 거기에 나옵니다.
 
 ## 상시 구동 (systemd)
 
