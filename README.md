@@ -604,6 +604,80 @@ somewhat more often.
 There is no server-side fix. `-c` cannot rise — [Host RAM](#host-ram-the-failure-mode-vram-numbers-do-not-predict)
 shows the ceiling is already binding — and the server cannot clamp what a client sends.
 
+There is, however, a client-side one. The next section corrects what this document said for its first
+several revisions: that nothing could bound the request at all.
+
+### The cap that does bound it: `maxTotalTextBytes`
+
+**Correction (2026-08-27).** Earlier revisions of this section ended at "there is no server-side fix"
+and left the impression that the wall could only be managed statistically, by choosing `contextWindow`
+well. That is wrong. `@cline/core`'s `MessageBuilder` carries three separate limits, and one of them is
+a hard global bound on the whole request:
+
+| Constant | Default | Scope | Environment variable |
+|---|---:|---|---|
+| `maxToolResultChars` | 8,000 chars | **each tool-result block** | `CLINE_MESSAGE_BUILDER_MAX_TOOL_RESULT_CHARS` |
+| `maxFileContentChars` | 50,000 chars | `type:"file"` blocks | *(not exposed)* |
+| `maxTotalTextBytes` | 6,000,000 bytes | **the entire request** | `CLINE_MESSAGE_BUILDER_MAX_TOTAL_TEXT_BYTES` |
+
+The trap is that `maxToolResultChars` is applied **per content block** — `truncateToolResultContent`
+maps over the array and truncates each element independently. A tool result with twelve text blocks is
+capped twelve times and bounded nowhere. That is why an 8,000-character default coexists with the
+17K-token jumps measured above.
+
+`maxTotalTextBytes` is the only limit that sums across the request: `countMessageTextBytes` walks every
+message and every block, and if the total exceeds the budget, `collectTruncationCandidates` shrinks the
+largest contributors until it fits. It has simply never fired here — the default is 6 MB, roughly
+twenty times the ~256 KB that corresponds to the server's 65,536-token wall.
+
+Sizing it needs a bytes-per-token figure for *this* workload, not a rule of thumb. Measured by feeding
+30 source files from this machine to the running server's `/tokenize` endpoint:
+
+| | bytes/token |
+|---|---:|
+| median | 3.86 |
+| minimum (densest content) | 3.21 |
+| maximum | 4.57 |
+
+The cap is in bytes, so the dangerous direction is dense content: a fixed byte budget buys *more*
+tokens when the ratio is low. Size against the minimum, not the median.
+
+```
+message-text budget = 65,536 - 7,749 (system prompt + tool definitions)  = 57,787 tokens
+worst-case bytes    = 57,787 x 3.21                                     = 185,496 bytes
+adopted                                                                 = 180,000 bytes
+```
+
+At 180,000 bytes, even the densest content in this corpus cannot exceed ~56,000 tokens of message
+text, which leaves the request comfortably under the wall. And it does not interfere with normal
+operation: compaction already intervenes at 44,237 tokens (90% of 49,152), where the message text is
+about 140,800 bytes — below the cap. **It only clips the spike that compaction missed.**
+
+This is a net stretched underneath compaction, not a replacement for it. Truncation is lossier than
+summarisation: compaction rewrites the front of the conversation into a summary, while this silently
+removes the middle of the largest blocks. If it fires during ordinary work, the cap is too low.
+
+In `~/.bashrc` (verified against cline 3.0.60):
+
+```bash
+export CLINE_MESSAGE_BUILDER_MAX_TOTAL_TEXT_BYTES=180000
+```
+
+Three things to know about applying it:
+
+- **Restart the cline daemon completely.** The value is read once, when `MessageBuilder` is constructed.
+- **Check it with `bash -ic`, not `bash -lc`.** Ubuntu's stock `.bashrc` returns early for
+  non-interactive shells, so a login-shell probe reports an empty value even when the setting is live.
+  Launching cline from an interactive terminal is what makes it work — the same path by which
+  `CLINE_HUB_LOG_LEVEL` already reaches the daemon, which is how this was confirmed.
+- **The daemon bundle honours it.** `dist/hub/index.js` constructs its builder as
+  `new yY(G_())` — the same env parser as the CLI bundle — so this is not a CLI-only knob. The parser
+  is `parseInt(v, 10)` accepted when finite and positive.
+
+`contextWindow` stays at **49152**. The cap makes raising it *safe* from an overflow standpoint, but
+raising it means truncation does the work that compaction is doing now, and that is the worse of the
+two. The balance point measured over a month still stands.
+
 ## Speculative decoding: MTP pays, ngram-mod is unproven
 
 Three ideas were measured against the running configuration on the same fixed 21,525-token prompt,
@@ -1416,6 +1490,56 @@ Cline은 압축 판단을 로그로 남기고, 그걸 읽으면 이유가 나옵
 그러니 `contextWindow`와 `-c` 사이의 예약분은 사실 "생성용 여유"가 아닙니다 — **툴 결과 하나가 더 들어올 자리**이고, `n_predict`가 아니라 에이전트가 만들어낼 가장 큰 툴 결과에 맞춰 잡아야 합니다. 17K 증가폭을 감당하려면 `contextWindow ≤ 53,780`이 필요하고, 34,859짜리 이상치까지 덮으려면 ≤ 34,085이 되어 작업 컨텍스트가 반토막 납니다 — 그건 수지가 안 맞습니다. **49152**가 균형점입니다. 측정된 증가폭 8개 중 7개를 21,299토큰의 여유로 덮으면서, 대가는 압축이 다소 잦아지는 것뿐입니다.
 
 서버 쪽 해결책은 없습니다. `-c`는 못 올리고([호스트 RAM](#호스트-ram--vram-수치가-예측해주지-않는-고장) 절에서 천장이 이미 빡빡합니다), 서버는 클라이언트가 보내는 것을 깎을 수 없습니다.
+
+다만 **클라이언트 쪽 해결책은 있습니다.** 다음 절에서, 이 문서가 여러 리비전 동안 유지했던 "요청 크기를 막을 방법이 아예 없다"는 서술을 정정합니다.
+
+### 요청을 실제로 막는 상한 — `maxTotalTextBytes`
+
+**정정 (2026-08-27).** 이전 리비전은 이 절을 "서버 쪽 해결책은 없습니다"로 끝내면서, 벽은 `contextWindow`를 잘 고르는 통계적 관리로만 다룰 수 있다는 인상을 남겼습니다. 틀렸습니다. `@cline/core`의 `MessageBuilder`에는 상한이 셋 있고, 그중 하나는 **요청 전체에 걸리는 하드 상한**입니다.
+
+| 상수 | 기본값 | 적용 범위 | 환경변수 |
+|---|---:|---|---|
+| `maxToolResultChars` | 8,000자 | **툴 결과 블록 하나마다** | `CLINE_MESSAGE_BUILDER_MAX_TOOL_RESULT_CHARS` |
+| `maxFileContentChars` | 50,000자 | `type:"file"` 블록 | *(노출 안 됨)* |
+| `maxTotalTextBytes` | 6,000,000B | **요청 전체** | `CLINE_MESSAGE_BUILDER_MAX_TOTAL_TEXT_BYTES` |
+
+함정은 `maxToolResultChars`가 **블록 단위**로 적용된다는 점입니다. `truncateToolResultContent`는 배열을 `map`으로 돌며 원소마다 독립적으로 자릅니다. 텍스트 블록이 12개인 툴 결과는 12번 잘리고 총량은 어디에서도 안 막힙니다. 기본값이 8,000자인데도 위에서 측정한 17K 토큰 급증이 나오는 이유가 이것입니다.
+
+요청 전체를 합산하는 건 `maxTotalTextBytes` 하나뿐입니다. `countMessageTextBytes`가 모든 메시지의 모든 블록을 훑어 합계를 내고, 예산을 넘으면 `collectTruncationCandidates`가 큰 것부터 줄여 맞춥니다. 지금까지 한 번도 걸리지 않았을 뿐입니다 — 기본값 6MB는 서버의 65,536토큰 벽에 해당하는 약 256KB보다 **20배 이상** 큽니다.
+
+값을 정하려면 어림값이 아니라 **이 워크로드의** 바이트/토큰 비율이 필요합니다. 이 머신의 소스 파일 30개를 돌아가는 서버의 `/tokenize`에 넣어 실측했습니다.
+
+| | 바이트/토큰 |
+|---|---:|
+| 중앙값 | 3.86 |
+| 최소 (가장 조밀한 콘텐츠) | 3.21 |
+| 최대 | 4.57 |
+
+상한이 바이트 단위라 위험한 방향은 **조밀한 콘텐츠**입니다. 비율이 낮을수록 같은 바이트 예산이 더 많은 토큰을 삽니다. 중앙값이 아니라 **최소값** 기준으로 잡아야 합니다.
+
+```
+메시지 텍스트 예산 = 65,536 - 7,749 (시스템 프롬프트 + 툴 정의)  = 57,787 토큰
+최악 케이스 바이트 = 57,787 x 3.21                              = 185,496 B
+채택                                                            = 180,000 B
+```
+
+180,000B에서는 이 코퍼스에서 가장 조밀한 콘텐츠라도 메시지 텍스트가 약 56,000토큰을 넘지 못하므로, 요청은 벽 아래에 안전하게 머뭅니다. 평상시 동작도 방해하지 않습니다 — 압축이 이미 44,237토큰(49,152의 90%)에서 개입하고 그 시점의 메시지 텍스트는 약 140,800B로 상한 아래입니다. **압축이 놓친 급증만 자릅니다.**
+
+이건 압축을 **대체**하는 게 아니라 그 밑에 치는 그물입니다. 잘림은 요약보다 손실이 큽니다. 압축은 대화 앞부분을 요약으로 다시 쓰지만, 이 상한은 가장 큰 블록의 가운데를 조용히 들어냅니다. 평상시 작업 중에 이게 걸린다면 상한이 너무 낮은 것입니다.
+
+`~/.bashrc`에 (cline 3.0.60에서 확인):
+
+```bash
+export CLINE_MESSAGE_BUILDER_MAX_TOTAL_TEXT_BYTES=180000
+```
+
+적용할 때 알아둘 것 셋:
+
+- **cline 데몬을 완전히 종료 후 재실행할 것.** 값은 `MessageBuilder` 생성 시 한 번만 읽습니다.
+- **확인은 `bash -lc`가 아니라 `bash -ic`로.** 우분투 기본 `.bashrc`는 비대화형 셸에서 조기 반환하므로, 설정이 살아 있어도 로그인 셸로 찍어보면 빈 값이 나옵니다. cline을 대화형 터미널에서 띄우는 것이 이걸 동작하게 하는 조건이며, 기존 `CLINE_HUB_LOG_LEVEL`이 데몬까지 도달하는 것과 같은 경로입니다(그걸로 검증했습니다).
+- **데몬 번들도 이 값을 존중합니다.** `dist/hub/index.js`는 빌더를 `new yY(G_())`로 생성하는데 CLI 번들과 같은 env 파서입니다. CLI 전용 옵션이 아닙니다. 파서는 `parseInt(v, 10)` 후 유한하고 양수일 때만 통과시킵니다.
+
+`contextWindow`는 **49152** 그대로 둡니다. 이 상한이 생겨서 올려도 오버플로 측면에서는 안전해졌지만, 올리면 지금 압축이 하는 일을 **잘림**이 대신하게 되고 그건 둘 중 나쁜 쪽입니다. 한 달 실측으로 잡은 균형점을 유지합니다.
 
 ### 프롬프트 캐시 동작 — 느려지는 진짜 지점
 
