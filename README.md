@@ -4,7 +4,7 @@
 
 Measured notes and the running configuration for a 30B-class coding LLM at usable speed on a single 8GB GPU. Every number below was measured on the machine described here — including the approaches that turned out to be slower. The work started on Qwen3-Coder-30B-A3B; the current configuration runs Qwen3.6-35B-A3B, and both are documented.
 
-**Result: a 35B-parameter model with a 64K context on a GPU that holds neither** — 44.7 tok/s generation and 928 t/s prompt processing at a real 22K-token Cline working context, up from 21.1 tok/s on the model this document started with. The last 17.7% of that generation figure comes from MTP, measured in [Speculative decoding](#speculative-decoding-mtp-pays-ngram-mod-is-unproven). `ngram-mod` is stacked on top of it and costs nothing, but its gain is unproven — the section explains how a benchmark artifact nearly got it recorded as +17.9%.
+**Result: a 35B-parameter model with a 64K context on a GPU that holds neither** — 44.7 tok/s generation and 928 t/s prompt processing at a real 22K-token Cline working context, up from 21.1 tok/s on the model this document started with. The last 17.7% of that generation figure comes from MTP, measured in [Speculative decoding](#speculative-decoding-mtp-pays-ngram-mod-is-unproven). `ngram-mod` was stacked on top of it through several revisions of this document — every benchmark here said it was free — until a session sending repeated requests against one live server found it regresses generation **17%** from the second request on. It has been removed from production; see [the correction](#correction-2026-08-28-ngram-mod-regresses-across-repeated-requests).
 
 The context was 128K until a session that actually filled it exhausted host RAM and froze the machine. That is documented in [Host RAM](#host-ram-the-failure-mode-vram-numbers-do-not-predict), along with the measurement that shows 64K costs nothing to give up.
 
@@ -41,7 +41,7 @@ llama-server \
   -m Qwen3.6-35B-A3B-MTP-UD-Q3_K_XL.gguf \
   -ngl 99 -ncmoe 35 -fa on -t 6 -lm none -np 1 -kvu -ub 2048 \
   -c 65536 -ctk q8_0 -ctv q8_0 -sps 0.5 -rea off \
-  --spec-type draft-mtp,ngram-mod --spec-draft-n-max 2 \
+  --spec-type draft-mtp --spec-draft-n-max 2 \
   --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 \
   --host 127.0.0.1 --port 8080
 ```
@@ -55,7 +55,7 @@ sampling values differ.
 | Flag | Why |
 |---|---|
 | `-ncmoe 35` | Keep 35 of 40 layers' expert weights on the CPU. MTP needs more VRAM than the plain model: 33 loads but dies mid-inference, and 35 measured faster than 34 — see [Speculative decoding](#speculative-decoding-mtp-pays-ngram-mod-is-unproven) |
-| `--spec-type draft-mtp,ngram-mod --spec-draft-n-max 2` | Two speculators stacked. MTP is **+17.7% generation** against the same file with MTP off, and requires the `-MTP-` GGUF build of the model. `ngram-mod` rides along: it costs nothing measurable and wins big when the model emits text verbatim from its context, but no measurement here establishes a general gain |
+| `--spec-type draft-mtp --spec-draft-n-max 2` | MTP is **+17.7% generation** against the same file with MTP off, and requires the `-MTP-` GGUF build of the model. `ngram-mod` used to ride stacked on top of it; every single-shot benchmark in this document said it was free, but it regresses generation 17% once a server fields more than one request — removed from production, see [the correction](#correction-2026-08-28-ngram-mod-regresses-across-repeated-requests) |
 | `-c 65536` | Puts Cline's condense threshold at 61K — still far above the 28.3K that observed sessions actually reach, so prompt-cache rebuilds stop happening. Was 131072 until a full 128K context OOM'd the host; see [Host RAM](#host-ram-the-failure-mode-vram-numbers-do-not-predict) |
 | `-sps 0.5` | Slot-prompt similarity floor. The default of 0.10 lets a barely-related prompt claim a slot holding a 60K cache and destroy it |
 | `-rea off` | Disable thinking. Thought tokens are latency on every single tool call in an agent loop |
@@ -710,10 +710,12 @@ Three things are worth keeping from this.
 draft length nearly tripled — `ngram-mod` is not bound by `--spec-draft-n-max 2` the way the MTP head
 is. Whatever else is true, n-gram does not pre-empt MTP into being worse.
 
-**`ngram-mod` stays enabled, on no-harm grounds rather than measured gain.** Prompt processing is
+**`ngram-mod` stays enabled, on no-harm grounds rather than measured gain.** ~~Prompt processing is
 unchanged (−1.1%, inside noise), the fixed-prompt bench put its VRAM cost at 17 MiB, and it wins large
 whenever the model quotes its context back verbatim — which real agent work does constantly, in diffs
-and file rewrites. What is unproven is a *general* speedup, and this document does not claim one.
+and file rewrites. What is unproven is a *general* speedup, and this document does not claim one.~~
+**Wrong — see the correction below.** This held for the axis measured here (one continuous generation)
+and broke on the axis that matters in production (one server fielding many requests in sequence).
 
 **A synthetic driver has to be checked for degeneracy before its numbers are believed.** Aggregate
 throughput hid this completely; only the per-request distribution showed it. `scripts/agent-load.py`
@@ -724,6 +726,38 @@ the feature that cares about the difference.
 > larger, so peak host RSS runs above the 24.00 GiB measured for the old configuration against
 > `MemoryHigh`. That was measured afterwards and the limit moved to 25G — see
 > [What MTP did to the ceiling](#what-mtp-did-to-the-ceiling).
+
+### Correction (2026-08-28): ngram-mod regresses across repeated requests
+
+Everything above measured `ngram-mod` inside **one continuous generation** — a single fixed prompt, or
+`scripts/agent-load.py` growing one conversation. Real Cline usage is different: one long-lived server
+process fields many *independent* requests in sequence, and that axis had never been tested here.
+
+It matters. A separate optimisation session (working tree: `fastllm/`, not this repo) re-verified this
+document's baseline before starting new work and got 36.9 tok/s instead of the recorded 44.69. Sending
+the same fixed 22K-token prompt (`cache_prompt:false`, `n_predict=64`, `temp=0`) repeatedly against one
+warm server process, three independent cold restarts:
+
+| Config | run1 | run2 | run3 | run4 | run5 | run6 |
+|---|---:|---:|---:|---:|---:|---:|
+| `draft-mtp,ngram-mod` (previous production) | 44.38 | 36.18 | 36.96 | 36.91 | 36.77 | — |
+| `draft-mtp` alone | **44.37** | **44.25** | **44.45** | **44.44** | **44.38** | **44.45** |
+
+With `ngram-mod` stacked, only the first request after a restart runs at full speed; every request after
+that lands **17% lower** and stays there. Drop `ngram-mod` and six consecutive requests hold steady
+within 0.2 tok/s of each other — this is the document's original 44.69 baseline, reproduced.
+
+This does not contradict the [MTP-stacking measurement above](#stacking-ngram-mod-on-mtp-and-the-artifact-that-nearly-got-published)
+— that isolated a single continuous generation, and this is a different axis: independent requests
+sharing one server process, which is exactly Cline's session shape. The likely mechanism (unconfirmed):
+`ngram-mod`'s n-gram cache persists across requests, and from the second request on it spends more
+verifying speculations drawn from the *previous* request's content than it saves.
+
+**Removed from production** (2026-08-28, `~/bin/run-server.sh` and [`scripts/run-server.sh`](scripts/run-server.sh)):
+`--spec-type draft-mtp,ngram-mod` → `--spec-type draft-mtp`. Lossless — the underlying generation
+algorithm is unchanged, this only drops a flag — and immediately reproducible: **tg 36.9 → 44.4 tok/s
+(+20%) from the second request onward**, which is the actual shape of a Cline session, not the
+first-request number this document previously led with.
 
 ## Model landscape, August 2026
 
@@ -853,7 +887,7 @@ Full measurement logs, per-flag reasoning, and the complete benchmark appendix a
   -m ~/models/Qwen3.6-35B-A3B-MTP-UD-Q3_K_XL.gguf \
   -ngl 99 -ncmoe 35 -fa on -t 6 -lm none -np 1 -kvu -ub 2048 \
   -c 65536 -ctk q8_0 -ctv q8_0 -sps 0.5 -rea off \
-  --spec-type draft-mtp,ngram-mod --spec-draft-n-max 2 \
+  --spec-type draft-mtp --spec-draft-n-max 2 \
   --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 \
   --host 127.0.0.1 --port 8080
 ```
@@ -861,7 +895,7 @@ Full measurement logs, per-flag reasoning, and the complete benchmark appendix a
 체크인된 [`scripts/run-server.sh`](scripts/run-server.sh)가 이 설정입니다. 아래 "2026년 8월 기준 모델 지형"의 A/B 실측에서 동일 VRAM으로 **생성 +72%, 프롬프트 처리 +16%, 컨텍스트 2배**가 확인되어 Qwen3-Coder-30B-A3B 설정을 대체했습니다.
 
 - `-ncmoe 35`: 40개 레이어 중 35개의 전문가 가중치를 CPU에. MTP는 일반 모델보다 VRAM을 더 먹어서 33은 로드는 되지만 추론 중에 죽고, 34보다 35가 더 빨랐습니다([투기적 디코딩](#투기적-디코딩--mtp는-값을-하고-ngram-mod는-미결이다) 절)
-- **`--spec-type draft-mtp,ngram-mod --spec-draft-n-max 2`**: 투기 디코딩 둘을 겹칩니다. MTP는 같은 파일에서 MTP만 끈 대조군 대비 **생성 +17.7%**이고, 모델의 `-MTP-` GGUF 빌드가 필요합니다. `ngram-mod`는 얹어만 둔 상태입니다 — 측정 가능한 비용이 없고 모델이 컨텍스트의 문장을 축자로 뱉을 때 크게 이기지만, 일반적인 이득을 입증한 측정은 여기 없습니다
+- **`--spec-type draft-mtp --spec-draft-n-max 2`**: MTP는 같은 파일에서 MTP만 끈 대조군 대비 **생성 +17.7%**이고, 모델의 `-MTP-` GGUF 빌드가 필요합니다. `ngram-mod`를 얹어 뒀던 적이 있습니다 — 이 문서의 단발 벤치마크는 전부 무해하다고 나왔지만, 서버가 요청을 두 개 이상 처리하면 생성이 17% 떨어집니다. 운영에서 뺐습니다. [정정](#정정-2026-08-28-ngram-mod는-반복-요청에서-저하됩니다) 참고
 - `-c 65536`: Cline 압축 임계를 61k에 놓습니다. 실측 세션이 실제로 도달하는 28.3k보다 한참 위라 캐시 재구축이 일어나지 않습니다. 131072를 쓰다가 128k를 실제로 채운 세션이 호스트를 OOM으로 몰아 낮췄습니다([호스트 RAM](#호스트-ram--vram-수치가-예측해주지-않는-고장) 절)
 - **`-sps 0.5`**: 슬롯 재사용 최소 유사도. 기본값 0.10은 거의 무관한 프롬프트가 6만 토큰 캐시를 들고 있는 슬롯을 차지해 파괴하도록 허용합니다(아래 절 참고)
 - `-rea off`: thinking 차단. 에이전트 루프에서는 사고 토큰이 매 툴 콜마다 지연으로 쌓입니다
@@ -1659,16 +1693,49 @@ draft-mtp,ngram  gen: [102 ×12] 120 60 45 … [81 ×12] 120 65 74 …
 길이는 거의 3배가 됐습니다 — `ngram-mod`는 MTP 헤드와 달리 `--spec-draft-n-max 2`에 묶이지 않기
 때문입니다. 다른 건 몰라도, n-gram이 MTP를 밀어내 더 나쁘게 만들지는 않습니다.
 
-**`ngram-mod`는 켜 둡니다. 측정된 이득이 아니라 무해함이 근거입니다.** 프롬프트 처리는 그대로이고
+**`ngram-mod`는 켜 둡니다. 측정된 이득이 아니라 무해함이 근거입니다.** ~~프롬프트 처리는 그대로이고
 (−1.1%, 편차 안), 고정 프롬프트 벤치에서 VRAM 비용은 17 MiB였으며, 모델이 컨텍스트를 축자로 인용할
 때는 크게 이깁니다 — 실제 에이전트 작업은 diff와 파일 재작성에서 그걸 끊임없이 합니다. 입증되지
-않은 것은 *일반적인* 속도 향상이고, 이 문서는 그걸 주장하지 않습니다.
+않은 것은 *일반적인* 속도 향상이고, 이 문서는 그걸 주장하지 않습니다.~~ **틀렸습니다 — 아래 정정
+참고.** 여기서 측정한 축(연속된 생성 하나)에서는 맞았고, 운영에서 실제로 중요한 축(서버 하나가
+요청을 여러 개 연달아 처리)에서는 깨졌습니다.
 
 **합성 드라이버는 수치를 믿기 전에 퇴화 여부부터 확인해야 합니다.** 합계 처리량은 이 문제를 완전히
 가렸고, 요청별 분포만이 드러냈습니다. `scripts/agent-load.py`는 현실적인 컨텍스트를 만들지만 현실적인
 *출력*을 만들지는 않는데, 투기 디코딩은 하필 그 차이에 민감한 기능입니다.
 
 > **호스트 RAM.** `-ncmoe 35`는 익스퍼트 두 레이어를 시스템 RAM으로 더 내리고 파일도 0.35 GB 큽니다. 따라서 호스트 RSS 피크가 옛 설정에서 측정한 24.00 GiB(상한 `MemoryHigh=24G`)보다 위로 올라갑니다. 그래서 나중에 측정하고 상한을 25G로 올렸습니다 — [MTP가 천장에 한 일](#mtp가-천장에-한-일) 절 참고.
+
+### 정정 (2026-08-28): ngram-mod는 반복 요청에서 저하됩니다
+
+위 실측은 전부 **연속된 생성 하나** 안에서 이루어졌습니다 — 고정 프롬프트 하나, 또는
+`scripts/agent-load.py`가 대화 하나를 키워가는 방식입니다. 실제 Cline 사용은 다릅니다 — 오래 떠 있는
+서버 프로세스 하나가 **독립적인 요청 여러 개**를 순서대로 처리하고, 그 축은 여태 검증된 적이 없었습니다.
+
+실제로 문제였습니다. 별도의 최적화 세션(작업 트리 `fastllm/`, 이 저장소가 아님)이 새 작업을 시작하기
+전 이 문서의 기준선을 재현하다가 기록값 44.69 대신 **36.9**를 얻었습니다. 동일한 22K 고정 프롬프트를
+(`cache_prompt:false`, `n_predict=64`, `temp=0`) 하나의 웜 서버 프로세스에 반복 호출, 독립된 콜드
+재시작 3회:
+
+| 구성 | run1 | run2 | run3 | run4 | run5 | run6 |
+|---|---:|---:|---:|---:|---:|---:|
+| `draft-mtp,ngram-mod` (기존 운영) | 44.38 | 36.18 | 36.96 | 36.91 | 36.77 | — |
+| `draft-mtp` 단독 | **44.37** | **44.25** | **44.45** | **44.44** | **44.38** | **44.45** |
+
+`ngram-mod`를 얹으면 재시작 후 **첫 요청만** 제 속도로 돌고, 두 번째 요청부터 **17% 낮게** 떨어져
+그대로 유지됩니다. `ngram-mod`를 빼면 6회 연속 요청이 0.2 tok/s 이내로 안정적입니다 — 이 문서가
+원래 기록한 기준선(44.69)이 그대로 재현된 것입니다.
+
+이건 [위의 MTP 스태킹 실측](#mtp-위에-ngram-mod-겹치기--하마터면-발행할-뻔한-아티팩트)과 모순되지
+않습니다 — 그건 연속된 생성 하나만 격리해 봤고, 이건 다른 축입니다: 서버 프로세스 하나를 공유하는
+독립된 요청들이고, 이게 정확히 Cline 세션의 형태입니다. 추정 메커니즘(미확인)은, `ngram-mod`의
+n-gram 캐시가 요청 사이에도 유지되면서 두 번째 요청부터는 **직전 요청** 내용에서 뽑은 추측을 검증하는
+비용이 절감분을 넘어선다는 것입니다.
+
+**운영에서 즉시 반영됨** (2026-08-28, `~/bin/run-server.sh`와 [`scripts/run-server.sh`](scripts/run-server.sh)):
+`--spec-type draft-mtp,ngram-mod` → `--spec-type draft-mtp`. 무손실입니다 — 생성 알고리즘 자체는
+그대로이고 플래그 하나만 뺐습니다 — 그리고 즉시 재현됩니다: **tg 36.9 → 44.4 tok/s (+20%), 두 번째
+요청부터** — 이게 Cline 세션의 실제 모양이지, 이 문서가 지금까지 앞세운 첫 요청 수치가 아닙니다.
 
 ## 2026년 8월 기준 모델 지형
 
