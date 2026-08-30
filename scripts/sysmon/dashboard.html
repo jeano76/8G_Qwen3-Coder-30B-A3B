@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<title>GPU / CPU 모니터</title>
+<style>
+  :root{
+    --bg:#0f1115; --card:#1a1d24; --card-border:#262a33;
+    --text:#e8eaed; --sub:#8b93a1;
+    --cpu:#5b9dff; --gpu:#b280ff; --mem:#ffb454;
+    --ok:#3ecf8e; --warn:#f2c94c; --bad:#f26d6d;
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0; background:var(--bg); color:var(--text);
+    font-family:-apple-system,"Segoe UI",Pretendard,"Noto Sans KR",sans-serif;
+    padding:24px; min-height:100vh;
+  }
+  h1{font-size:18px; font-weight:600; margin:0 0 4px;}
+  .sub{color:var(--sub); font-size:13px; margin:0 0 20px;}
+  .grid{display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:16px;}
+  .card{
+    background:var(--card); border:1px solid var(--card-border);
+    border-radius:14px; padding:18px 20px;
+  }
+  .card-head{display:flex; align-items:baseline; justify-content:space-between; margin-bottom:10px;}
+  .card-title{font-size:14px; font-weight:600; color:var(--sub); text-transform:uppercase; letter-spacing:.04em;}
+  .metric-row{display:flex; align-items:baseline; gap:10px; margin-bottom:12px;}
+  .metric-group{display:flex; gap:34px; margin-bottom:14px;}
+  .metric-block{display:flex; flex-direction:column;}
+  .metric-block .big{font-size:46px;}
+  .metric-label{font-size:11px; color:var(--sub); text-transform:uppercase; letter-spacing:.06em; margin-top:2px;}
+  .big{font-size:40px; font-weight:700; line-height:1; transition:color .4s ease;}
+  .unit{font-size:16px; color:var(--sub);}
+  .bar-track{height:8px; border-radius:5px; background:#262a33; overflow:hidden; margin-bottom:14px;}
+  .bar-fill{height:100%; border-radius:5px; transition:width .4s ease, background-color .4s ease;}
+  .stat-line{display:flex; justify-content:space-between; font-size:13px; color:var(--sub); padding:3px 0;}
+  .stat-line b{color:var(--text); font-weight:600;}
+  .badge{
+    display:inline-block; padding:2px 9px; border-radius:999px; font-size:12px; font-weight:600;
+  }
+  canvas{width:100%; height:52px; display:block; margin-top:10px;}
+  .gpu-name{font-size:12px; color:var(--sub); margin-top:-6px; margin-bottom:12px;}
+  .footer{margin-top:18px; color:var(--sub); font-size:12px; display:flex; align-items:center; gap:8px;}
+  .dot{width:8px; height:8px; border-radius:50%; background:var(--ok); box-shadow:0 0 8px var(--ok);}
+  .dot.off{background:var(--bad); box-shadow:0 0 8px var(--bad);}
+</style>
+</head>
+<body>
+  <h1>GPU / CPU 실시간 모니터</h1>
+  <p class="sub" id="hostline">불러오는 중…</p>
+
+  <div class="grid">
+    <div class="card">
+      <div class="card-head"><span class="card-title">CPU</span></div>
+      <div class="metric-group">
+        <div class="metric-block">
+          <span><span class="big" id="cpu-pct">–</span><span class="unit">%</span></span>
+          <span class="metric-label">사용률</span>
+        </div>
+        <div class="metric-block">
+          <span><span class="big" id="cpu-temp">–</span><span class="unit">°C</span></span>
+          <span class="metric-label">온도</span>
+        </div>
+      </div>
+      <div class="bar-track"><div class="bar-fill" id="cpu-bar" style="width:0%;background:var(--cpu)"></div></div>
+      <div class="stat-line"><span>코어 수</span><b id="cpu-cores">–</b></div>
+
+      <div class="stat-line" style="margin-top:6px"><span>시스템 메모리 (RAM)</span><b id="mem-pct">–%</b></div>
+      <div class="bar-track"><div class="bar-fill" id="mem-bar" style="width:0%;background:var(--mem)"></div></div>
+      <div class="stat-line"><span>사용량</span><b id="mem-used">– / – GB</b></div>
+      <canvas id="cpu-chart" width="600" height="52"></canvas>
+    </div>
+
+    <div class="card">
+      <div class="card-head"><span class="card-title">GPU</span></div>
+      <div class="gpu-name" id="gpu-name">GPU 정보 없음</div>
+      <div class="metric-group">
+        <div class="metric-block">
+          <span><span class="big" id="gpu-pct">–</span><span class="unit">%</span></span>
+          <span class="metric-label">사용률</span>
+        </div>
+        <div class="metric-block">
+          <span><span class="big" id="gpu-temp">–</span><span class="unit">°C</span></span>
+          <span class="metric-label">온도</span>
+        </div>
+      </div>
+      <div class="bar-track"><div class="bar-fill" id="gpu-bar" style="width:0%;background:var(--gpu)"></div></div>
+
+      <div class="stat-line" style="margin-top:6px"><span>GPU 메모리 (VRAM)</span><b id="gpu-mem-pct">–%</b></div>
+      <div class="bar-track"><div class="bar-fill" id="gpu-mem-bar" style="width:0%;background:var(--gpu)"></div></div>
+      <div class="stat-line"><span>사용량</span><b id="gpu-vram">– / – GB</b></div>
+      <div class="stat-line"><span>전력</span><b id="gpu-power">– / – W</b></div>
+      <canvas id="gpu-chart" width="600" height="52"></canvas>
+    </div>
+
+  </div>
+
+  <div class="footer"><span class="dot" id="live-dot"></span><span id="live-text">연결 중…</span></div>
+
+<script>
+const $ = id => document.getElementById(id);
+
+function levelColor(pct, kind){
+  // kind: 'usage' | 'temp'
+  const t = kind === 'temp'
+    ? (pct >= 85 ? 'bad' : pct >= 70 ? 'warn' : 'ok')
+    : (pct >= 90 ? 'bad' : pct >= 70 ? 'warn' : 'ok');
+  return getComputedStyle(document.documentElement).getPropertyValue('--' + t).trim();
+}
+
+function drawSpark(canvas, values, color){
+  const ctx = canvas.getContext('2d');
+  const w = canvas.width, h = canvas.height;
+  ctx.clearRect(0,0,w,h);
+  if (values.length < 2) return;
+  const max = 100;
+  const step = w / (values.length - 1);
+  ctx.beginPath();
+  values.forEach((v,i) => {
+    const x = i * step;
+    const y = h - (Math.min(v,max)/max) * (h-4) - 2;
+    i === 0 ? ctx.moveTo(x,y) : ctx.lineTo(x,y);
+  });
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 2;
+  ctx.lineJoin = 'round';
+  ctx.stroke();
+  ctx.lineTo(w, h);
+  ctx.lineTo(0, h);
+  ctx.closePath();
+  ctx.globalAlpha = 0.15;
+  ctx.fillStyle = color;
+  ctx.fill();
+  ctx.globalAlpha = 1;
+}
+
+function gb(bytes){ return (bytes / (1024**3)).toFixed(1); }
+
+async function tick(){
+  try{
+    const res = await fetch('/api/history', {cache:'no-store'});
+    const hist = await res.json();
+    if (!hist.length) return;
+    const last = hist[hist.length - 1];
+
+    $('live-dot').classList.remove('off');
+    $('live-text').textContent = '실시간 갱신 중 (1초 간격)';
+    $('hostline').textContent = new Date(last.ts*1000).toLocaleTimeString('ko-KR') + ' 기준';
+
+    // CPU
+    const cpuPct = last.cpu.percent;
+    $('cpu-pct').textContent = cpuPct.toFixed(0);
+    $('cpu-bar').style.width = cpuPct + '%';
+    $('cpu-bar').style.background = levelColor(cpuPct, 'usage');
+    $('cpu-cores').textContent = last.cpu.per_cpu.length + '개';
+    if (last.cpu.temp != null){
+      $('cpu-temp').textContent = last.cpu.temp.toFixed(0);
+      $('cpu-temp').style.color = levelColor(last.cpu.temp, 'temp');
+    }
+    drawSpark($('cpu-chart'), hist.map(h=>h.cpu.percent), '#5b9dff');
+
+    // GPU
+    if (last.gpu){
+      const g = last.gpu;
+      $('gpu-name').textContent = 'NVIDIA GPU';
+      $('gpu-pct').textContent = g.util.toFixed(0);
+      $('gpu-bar').style.width = g.util + '%';
+      $('gpu-bar').style.background = levelColor(g.util, 'usage');
+      const gpuMemPct = (g.mem_used / g.mem_total) * 100;
+      $('gpu-mem-pct').textContent = gpuMemPct.toFixed(0) + '%';
+      $('gpu-mem-bar').style.width = gpuMemPct + '%';
+      $('gpu-mem-bar').style.background = levelColor(gpuMemPct, 'usage');
+      $('gpu-vram').textContent = gb(g.mem_used*1024*1024) + ' / ' + gb(g.mem_total*1024*1024) + ' GB';
+      $('gpu-power').textContent = g.power_draw.toFixed(0) + ' / ' + g.power_limit.toFixed(0) + ' W';
+      $('gpu-temp').textContent = g.temp.toFixed(0);
+      $('gpu-temp').style.color = levelColor(g.temp, 'temp');
+      drawSpark($('gpu-chart'), hist.map(h=>h.gpu ? h.gpu.util : 0), '#b280ff');
+    } else {
+      $('gpu-name').textContent = 'nvidia-smi로 GPU를 찾을 수 없음';
+    }
+
+    // Memory
+    const mem = last.mem;
+    $('mem-pct').textContent = mem.percent.toFixed(0) + '%';
+    $('mem-bar').style.width = mem.percent + '%';
+    $('mem-bar').style.background = levelColor(mem.percent, 'usage');
+    $('mem-used').textContent = gb(mem.used) + ' / ' + gb(mem.total) + ' GB';
+
+  }catch(e){
+    $('live-dot').classList.add('off');
+    $('live-text').textContent = '서버에 연결할 수 없음';
+  }
+}
+
+tick();
+setInterval(tick, 1000);
+</script>
+</body>
+</html>
